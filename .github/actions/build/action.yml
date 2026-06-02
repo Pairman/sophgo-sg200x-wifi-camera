@@ -48,16 +48,15 @@ runs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
           ca-certificates git make pkg-config tar
-        mkdir -p sdk/image sdk/work tmp/host-tools
 
     - name: Clone and build SG200x builder image
       shell: bash
       run: |
         git clone --no-checkout --depth 1 "${{ env.SOPHGO_DEBIAN_REPO }}" sdk
-        cd sdk
-        git fetch --depth 1 origin "${{ env.SOPHGO_DEBIAN_REF }}"
-        git checkout --detach FETCH_HEAD
+        git -C sdk fetch --depth 1 origin "${{ env.SOPHGO_DEBIAN_REF }}"
+        git -C sdk checkout --detach FETCH_HEAD
         docker build -t sg200x-builder -f sdk/scripts/Dockerfile sdk
+        mkdir -p sdk/image sdk/work tmp/host-tools
 
     - name: Build middleware
       shell: bash
