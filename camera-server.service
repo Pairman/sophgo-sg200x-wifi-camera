@@ -1,0 +1,14 @@
+[Unit]
+Description=WiFi Camera Server
+After=network.target
+
+[Service]
+Type=idle
+TimeoutStartSec=5m
+Restart=on-failure
+RestartSec=60s
+WorkingDirectory=/var/lib/wifi-camera
+ExecStart=/usr/bin/camera-server -p 8001
+
+[Install]
+WantedBy=multi-user.target

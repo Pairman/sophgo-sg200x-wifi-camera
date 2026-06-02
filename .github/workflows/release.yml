@@ -1,0 +1,32 @@
+name: release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wifi-camera
+          path: dist
+
+      - name: Create release tag
+        shell: bash
+        run: echo "TAG=v$(date -u +%Y%m%d%H%M%S)" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          token: ${{ github.token }}
+          files: |
+            dist/wifi-camera.tar.gz
+            dist/wifi-camera.tar.gz.sha256

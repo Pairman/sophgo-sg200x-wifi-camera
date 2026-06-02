@@ -1,0 +1,10 @@
+dist/
+*.[od]
+camera_clip
+camera_frame
+camera_stream
+camera_server
+
+*.jpg
+*.mp4
+recordings/

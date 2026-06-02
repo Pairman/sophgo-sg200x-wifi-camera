@@ -1,0 +1,109 @@
+name: Build
+description: Build and package wifi-camera for SG200x.
+
+inputs:
+  SOPHGO_DEBIAN_REPO:
+    description: image repo url
+    default: https://github.com/Pairman/sophgo-sg200x-debian
+  SOPHGO_DEBIAN_REF:
+    description: image repo git ref
+    default: main
+  BOARD:
+    description: board name
+    default: licheervnano
+  VARIANT:
+    description: board variant
+    default: e
+  MIDDLEWARE_DIR:
+    description: middleware path
+    default: /build/middleware
+  KERNEL_DIR:
+    description: Kernel build/header path inside the build container
+    default: /build/kernel/build/licheervnano-e
+  CROSS_COMPILE:
+    description: Cross compiler prefix inside the build container
+    default: /host-tools/gcc/riscv64-linux-x86_64/bin/riscv64-unknown-linux-gnu-
+  SYSROOT:
+    description: Toolchain sysroot inside the build container
+    default: /host-tools/gcc/riscv64-linux-x86_64/sysroot
+
+runs:
+  using: composite
+  steps:
+    - name: Setup environment variables
+      shell: bash
+      run: |
+        echo "SOPHGO_DEBIAN_REPO=${{ inputs.SOPHGO_DEBIAN_REPO }}" >> $GITHUB_ENV
+        echo "SOPHGO_DEBIAN_REF=${{ inputs.SOPHGO_DEBIAN_REF }}" >> $GITHUB_ENV
+        echo "BOARD=${{ inputs.BOARD }}" >> $GITHUB_ENV
+        echo "VARIANT=${{ inputs.VARIANT }}" >> $GITHUB_ENV
+        echo "MIDDLEWARE_DIR=${{ inputs.MIDDLEWARE_DIR }}" >> $GITHUB_ENV
+        echo "KERNEL_DIR=${{ inputs.KERNEL_DIR }}" >> $GITHUB_ENV
+        echo "CROSS_COMPILE=${{ inputs.CROSS_COMPILE }}" >> $GITHUB_ENV
+        echo "SYSROOT=${{ inputs.SYSROOT }}" >> $GITHUB_ENV
+
+    - name: Setup environment
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          ca-certificates git make pkg-config tar
+        mkdir -p sdk/image sdk/work tmp/host-tools
+
+    - name: Clone and build SG200x builder image
+      shell: bash
+      run: |
+        git clone --no-checkout --depth 1 "${{ env.SOPHGO_DEBIAN_REPO }}" sdk
+        cd sdk
+        git fetch --depth 1 origin "${{ env.SOPHGO_DEBIAN_REF }}"
+        git checkout --detach FETCH_HEAD
+        docker build -t sg200x-builder -f sdk/scripts/Dockerfile sdk
+
+    - name: Build middleware
+      shell: bash
+      run: |
+        docker run --privileged --rm \
+          -e PROJECT_FULLNAME=${{ inputs.BOARD }}-${{ inputs.VARIANT }} \
+          -e SDK_VER=glibc_riscv64 \
+          -e CHIP_ARCH=CV181X \
+          -e CVIARCH=CV181X \
+          -e CROSS_COMPILE_GLIBC_RISCV64="${{ env.CROSS_COMPILE }}" \
+          -v "$PWD/tmp/host-tools:/host-tools" \
+          -v "$PWD/sdk/configs:/configs" \
+          -v "$PWD/sdk/scripts:/builder" \
+          -v "$PWD/sdk/image:/output" \
+          -v "$PWD/sdk/work:/build" \
+          sg200x-builder make BOARD="${{ env.BOARD }}" middleware
+
+    - name: Build and stage wifi-camera
+      shell: bash
+      run: |
+        rm -rf dist/root
+        docker run --privileged --rm \
+          -e PROJECT_FULLNAME=${{ inputs.BOARD }}-${{ inputs.VARIANT }} \
+          -e SDK_VER=glibc_riscv64 \
+          -e CHIP_ARCH=CV181X \
+          -e CVIARCH=CV181X \
+          -e MIDDLEWARE_DIR="${{ env.MIDDLEWARE_DIR }}" \
+          -e KERNEL_DIR="${{ env.KERNEL_DIR }}" \
+          -e CROSS_COMPILE="${{ env.CROSS_COMPILE }}" \
+          -e SYSROOT="${{ env.SYSROOT }}" \
+          -v "$PWD/tmp/host-tools:/host-tools" \
+          -v "$PWD/sdk/work:/build" \
+          -v "$PWD:/src" \
+          sg200x-builder bash -lc 'cd /src && make install DESTDIR=/src/dist/root PREFIX=/usr'
+
+    - name: Package artifact
+      shell: bash
+      run: |
+        mkdir -p dist
+        tar -C dist/root -czf "dist/wifi-camera.tar.gz" .
+        sha256sum "dist/wifi-camera.tar.gz" > "dist/wifi-camera.tar.gz.sha256"
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: wifi-camera
+        path: |
+          dist/wifi-camera.tar.gz
+          dist/wifi-camera.tar.gz.sha256
