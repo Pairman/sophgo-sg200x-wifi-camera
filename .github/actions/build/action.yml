@@ -92,6 +92,7 @@ runs:
           -v "$PWD/sdk/work:/build" \
           -v "$PWD:/src" \
           sg200x-builder bash -lc 'cd /src && make install DESTDIR=/src/dist/root PREFIX=/usr'
+        sudo chown -R "$(id -u):$(id -g)" "$PWD"
 
     - name: Package artifact
       shell: bash
