@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -396,11 +397,17 @@ static CVI_S32 capture_frame(const char *output_path)
 	return ret;
 }
 
-int main(void)
+static void usage(const char *program)
 {
-	char output_path[64];
+	fprintf(stderr, "Usage: %s [-o output.jpg]\n", program);
+}
+
+int main(int argc, char **argv)
+{
+	char output_path[PATH_MAX];
 	time_t now;
 	CVI_S32 ret;
+	int opt;
 
 	now = time(NULL);
 	if (now == (time_t)-1) {
@@ -409,6 +416,28 @@ int main(void)
 	}
 
 	snprintf(output_path, sizeof(output_path), "frame_%lld.jpg", (long long)now);
+
+	while ((opt = getopt(argc, argv, "o:")) != -1) {
+		switch (opt) {
+		case 'o':
+			if (optarg[0] == '\0') {
+				usage(argv[0]);
+				return 1;
+			}
+			if (snprintf(output_path, sizeof(output_path), "%s", optarg) >= (int)sizeof(output_path)) {
+				fprintf(stderr, "output path too long\n");
+				return 1;
+			}
+			break;
+		default:
+			usage(argv[0]);
+			return 1;
+		}
+	}
+	if (optind != argc) {
+		usage(argv[0]);
+		return 1;
+	}
 
 	ret = capture_frame(output_path);
 	cleanup();

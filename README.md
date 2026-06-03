@@ -6,15 +6,15 @@ Small camera utils for LicheeRV Nano based on the on-board CVITEK middleware. Ba
 
 1. `camera-frame`
 
-Capture a JPEG frame: `sudo camera-frame`.
+Capture a JPEG frame: `sudo camera-frame -o out.jpg`.
 
 2. `camera-stream`
 
-Record an MP4 with H.264 video and AAC audio: `sudo camera-stream -s 10`, `-s` specifies duration in seconds.
+Record an MP4 with H.264 video and AAC audio: `sudo camera-stream -s 10 -o out.mp4`, `-s` specifies duration in seconds.
 
 3. `camera-server`
 
-Simple HTTP server for recording and management: `sudo camera-server -p 8001`, `-p` specifies port. `sudo systemctl enable camera-server.service` to make it auto-start.
+Simple HTTP server for recording and management: `sudo camera-server -p 8001`, `-p` specifies port. `sudo systemctl enable camera-server.service` to make it auto-start. User LED is used to display recording status.
 
 ## Data
 

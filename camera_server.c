@@ -28,6 +28,8 @@
 #define LIBEXEC_DIR "/usr/libexec/wifi-camera"
 #define RECORDINGS_DIR APP_DIR "/recordings"
 #define LOG_DIR "/var/log/wifi-camera"
+#define LED_TRIGGER_PATH "/sys/class/leds/led-user/trigger"
+#define LED_BRIGHTNESS_PATH "/sys/class/leds/led-user/brightness"
 #define LOW_SPACE_BYTES (2ULL * 1024ULL * 1024ULL * 1024ULL)
 #define MAX_REQ 8192
 #define MAX_BODY 4096
@@ -65,6 +67,9 @@ static time_t g_started_at;
 static char g_last_error[256];
 static FILE *g_log;
 
+static pid_t g_frame_pid = -1;
+static char g_frame_file[NAME_MAX + 1];
+
 static clip_state_t g_clip_state = CLIP_NONE;
 static pid_t g_clip_pid = -1;
 static char g_clip_input[NAME_MAX + 1];
@@ -101,6 +106,47 @@ static void log_msg(const char *fmt, ...)
 
 	fputc('\n', g_log);
 	fflush(g_log);
+}
+
+static int write_text_file(const char *path, const char *text)
+{
+	int fd;
+	size_t len;
+	ssize_t n;
+
+	fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+
+	len = strlen(text);
+	n = write(fd, text, len);
+	close(fd);
+	return n == (ssize_t)len ? 0 : -1;
+}
+
+static void set_record_led(bool recording)
+{
+	static int last = -1;
+
+	if (last == (recording ? 1 : 0))
+		return;
+
+	if (write_text_file(LED_TRIGGER_PATH, "none\n") != 0) {
+		log_msg("led trigger update failed: %s", strerror(errno));
+		return;
+	}
+	if (write_text_file(LED_BRIGHTNESS_PATH, recording ? "1\n" : "0\n") != 0) {
+		log_msg("led brightness update failed: %s", strerror(errno));
+		return;
+	}
+
+	last = recording ? 1 : 0;
+}
+
+static void set_rec_state(rec_state_t state)
+{
+	g_rec_state = state;
+	set_record_led(state == REC_STARTING || state == REC_RECORDING || state == REC_STOPPING);
 }
 
 static void signal_handler(int signo)
@@ -272,11 +318,11 @@ static void poll_children(void)
 		if (pid == g_rec_pid) {
 			if (g_rec_state == REC_STOPPING || (WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
 				log_msg("record stop success: %s", g_current_file);
-				g_rec_state = REC_IDLE;
+				set_rec_state(REC_IDLE);
 				set_last_error("");
 			} else {
 				log_msg("record process failed: status=%d file=%s", status, g_current_file);
-				g_rec_state = REC_ERROR;
+				set_rec_state(REC_ERROR);
 				set_last_error("recording process failed");
 			}
 			g_rec_pid = -1;
@@ -292,6 +338,18 @@ static void poll_children(void)
 				log_msg("clip failed: %s", g_clip_error);
 			}
 			g_clip_pid = -1;
+		} else if (pid == g_frame_pid) {
+			if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+				log_msg("frame capture success: %s", g_frame_file);
+				set_last_error("");
+			} else {
+				char failed_path[PATH_MAX];
+				snprintf(failed_path, sizeof(failed_path), "%s/%s", RECORDINGS_DIR, g_frame_file);
+				unlink(failed_path);
+				log_msg("frame capture failed: status=%d file=%s", status, g_frame_file);
+				set_last_error("frame capture failed");
+			}
+			g_frame_pid = -1;
 		}
 	}
 }
@@ -300,11 +358,11 @@ static void finish_recording_child(int status)
 {
 	if (g_rec_state == REC_STOPPING || (WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
 		log_msg("record stop success: %s", g_current_file);
-		g_rec_state = REC_IDLE;
+		set_rec_state(REC_IDLE);
 		set_last_error("");
 	} else {
 		log_msg("record process failed: status=%d file=%s", status, g_current_file);
-		g_rec_state = REC_ERROR;
+		set_rec_state(REC_ERROR);
 		set_last_error("recording process failed");
 	}
 	g_rec_pid = -1;
@@ -325,7 +383,7 @@ static int wait_recording_stopped(pid_t pid, int timeout_ms)
 		if (rc < 0) {
 			if (errno == ECHILD) {
 				g_rec_pid = -1;
-				g_rec_state = REC_IDLE;
+				set_rec_state(REC_IDLE);
 				set_last_error("");
 				return 0;
 			}
@@ -347,6 +405,10 @@ static int start_recording(void)
 	pid_t existing;
 
 	poll_children();
+	if (g_frame_pid > 0) {
+		set_last_error("frame capture active");
+		return 409;
+	}
 	if (g_rec_state == REC_STARTING || g_rec_state == REC_RECORDING || g_rec_state == REC_STOPPING) {
 		set_last_error("recording already active");
 		return 409;
@@ -371,14 +433,14 @@ static int start_recording(void)
 		BIN_DIR "/camera_stream",
 		"./camera_stream");
 
-	g_rec_state = REC_STARTING;
+	set_rec_state(REC_STARTING);
 	snprintf(g_current_file, sizeof(g_current_file), "%s", name);
 	g_started_at = time(NULL);
 	log_msg("record start requested: %s", name);
 
 	pid = fork();
 	if (pid < 0) {
-		g_rec_state = REC_ERROR;
+		set_rec_state(REC_ERROR);
 		set_last_error("fork failed");
 		log_msg("record start failed: fork: %s", strerror(errno));
 		return 500;
@@ -391,9 +453,56 @@ static int start_recording(void)
 	}
 
 	g_rec_pid = pid;
-	g_rec_state = REC_RECORDING;
+	set_rec_state(REC_RECORDING);
 	set_last_error("");
 	log_msg("record start success: pid=%ld file=%s", (long)pid, name);
+	return 200;
+}
+
+static int capture_frame(void)
+{
+	char name[NAME_MAX + 1];
+	char path[PATH_MAX];
+	char exe[PATH_MAX];
+	pid_t pid;
+
+	poll_children();
+	if (g_frame_pid > 0) {
+		set_last_error("frame capture active");
+		return 409;
+	}
+	if (g_rec_pid > 0 || g_rec_state == REC_STARTING || g_rec_state == REC_RECORDING || g_rec_state == REC_STOPPING) {
+		set_last_error("recording already active");
+		return 409;
+	}
+	if (low_storage()) {
+		set_last_error("low storage");
+		log_msg("frame capture rejected: low storage");
+		return 507;
+	}
+
+	make_datetime_name(name, sizeof(name), "frame_", ".jpg");
+	snprintf(path, sizeof(path), "%s/%s", RECORDINGS_DIR, name);
+	find_executable(exe, sizeof(exe),
+		SYSTEM_BIN_DIR "/camera-frame",
+		BIN_DIR "/camera_frame",
+		"./camera_frame");
+
+	pid = fork();
+	if (pid < 0) {
+		set_last_error("fork failed");
+		log_msg("frame capture failed: fork: %s", strerror(errno));
+		return 500;
+	}
+	if (pid == 0) {
+		execl(exe, exe, "-o", path, (char *)NULL);
+		_exit(127);
+	}
+
+	g_frame_pid = pid;
+	snprintf(g_frame_file, sizeof(g_frame_file), "%s", name);
+	set_last_error("");
+	log_msg("frame capture start: pid=%ld file=%s", (long)pid, name);
 	return 200;
 }
 
@@ -409,17 +518,17 @@ static int stop_recording(void)
 	}
 
 	pid = g_rec_pid;
-	g_rec_state = REC_STOPPING;
+	set_rec_state(REC_STOPPING);
 	log_msg("record stop requested: pid=%ld file=%s", (long)pid, g_current_file);
 	if (kill(pid, SIGTERM) != 0) {
 		if (errno == ESRCH) {
 			g_rec_pid = -1;
-			g_rec_state = REC_IDLE;
+			set_rec_state(REC_IDLE);
 			set_last_error("");
 			log_msg("record stop: recorder already exited");
 			return 200;
 		}
-		g_rec_state = REC_ERROR;
+		set_rec_state(REC_ERROR);
 		set_last_error("failed to signal recorder");
 		log_msg("record stop failed: %s", strerror(errno));
 		return 500;
@@ -427,7 +536,7 @@ static int stop_recording(void)
 
 	rc = wait_recording_stopped(pid, 3000);
 	if (rc < 0) {
-		g_rec_state = REC_ERROR;
+		set_rec_state(REC_ERROR);
 		set_last_error("failed to wait recorder");
 		log_msg("record stop wait failed: %s", strerror(errno));
 		return 500;
@@ -588,7 +697,7 @@ static void check_orphan_recorder_on_startup(void)
 		return;
 	}
 
-	g_rec_state = REC_ERROR;
+	set_rec_state(REC_ERROR);
 	snprintf(g_last_error, sizeof(g_last_error),
 		"existing camera_stream process is still running: pid=%ld", (long)pid);
 	log_msg("%s", g_last_error);
@@ -761,7 +870,7 @@ static int list_recordings(recording_t *items, int max_items)
 
 		if (!safe_filename(ent->d_name))
 			continue;
-		if (!has_suffix(ent->d_name, ".mp4"))
+		if (!has_suffix(ent->d_name, ".mp4") && !has_suffix(ent->d_name, ".jpg"))
 			continue;
 		snprintf(path, sizeof(path), "%s/%s", RECORDINGS_DIR, ent->d_name);
 		if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
@@ -796,6 +905,15 @@ static void set_socket_timeouts(int fd)
 	tv.tv_usec = 0;
 	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static int set_close_on_exec(int fd)
+{
+	int flags = fcntl(fd, F_GETFD);
+
+	if (flags < 0)
+		return -1;
+	return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
 static void http_reply(int fd, int code, const char *type, const char *body)
@@ -851,11 +969,11 @@ static void reply_status(int fd)
 	json_escape(err, sizeof(err), g_last_error);
 	snprintf(body, sizeof(body),
 		"{\"state\":\"%s\",\"recording\":%s,\"current_file\":\"%s\","
-		"\"duration_ms\":%ld,\"free_bytes\":%llu,\"low_storage\":%s,"
+		"\"duration_ms\":%ld,\"frame_capturing\":%s,\"free_bytes\":%llu,\"low_storage\":%s,"
 		"\"last_error\":\"%s\"}",
 		state_name(g_rec_state),
 		g_rec_state == REC_RECORDING ? "true" : "false",
-		file, duration, (unsigned long long)free_bytes(),
+		file, duration, g_frame_pid > 0 ? "true" : "false", (unsigned long long)free_bytes(),
 		low_storage() ? "true" : "false", err);
 	http_reply(fd, 200, "application/json", body);
 }
@@ -873,8 +991,10 @@ static void reply_recordings(int fd)
 	for (int i = 0; i < count && left > 128; ++i) {
 		char name[NAME_MAX * 2];
 		json_escape(name, sizeof(name), items[i].name);
-		p += snprintf(p, left, "%s{\"name\":\"%s\",\"size\":%llu,\"mtime\":%lld}",
-			i == 0 ? "" : ",", name, (unsigned long long)items[i].size,
+		p += snprintf(p, left, "%s{\"name\":\"%s\",\"type\":\"%s\",\"size\":%llu,\"mtime\":%lld}",
+			i == 0 ? "" : ",", name,
+			has_suffix(items[i].name, ".mp4") ? "video" : "photo",
+			(unsigned long long)items[i].size,
 			(long long)items[i].mtime);
 		left = sizeof(body) - (size_t)(p - body);
 	}
@@ -987,6 +1107,8 @@ static int start_clip(const char *filename, const char *body)
 	if (g_clip_state == CLIP_RUNNING)
 		return 409;
 	if (!safe_filename(filename))
+		return 400;
+	if (!has_suffix(filename, ".mp4"))
 		return 400;
 	if (!parse_json_long(body, "\"start_ms\"", &start_ms) ||
 	    !parse_json_long(body, "\"end_ms\"", &end_ms) ||
@@ -1117,6 +1239,10 @@ static void send_file(int fd, const char *filename, const char *req)
 		http_reply(fd, 400, "application/json", "{\"error\":\"bad filename\"}");
 		return;
 	}
+	if (!has_suffix(filename, ".mp4") && !has_suffix(filename, ".jpg")) {
+		http_reply(fd, 404, "application/json", "{\"error\":\"not found\"}");
+		return;
+	}
 	snprintf(path, sizeof(path), "%s/%s", RECORDINGS_DIR, filename);
 	in = open(path, O_RDONLY);
 	if (in < 0 || fstat(in, &st) != 0 || !S_ISREG(st.st_mode)) {
@@ -1151,15 +1277,17 @@ static void send_file(int fd, const char *filename, const char *req)
 	remaining = end - start + 1;
 	if (partial) {
 		snprintf(head, sizeof(head),
-			"HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\n"
+			"HTTP/1.1 206 Partial Content\r\nContent-Type: %s\r\n"
 			"Content-Length: %lld\r\nContent-Range: bytes %lld-%lld/%lld\r\n"
 			"Content-Disposition: inline; filename=\"%s\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+			has_suffix(filename, ".jpg") ? "image/jpeg" : "video/mp4",
 			(long long)remaining, (long long)start, (long long)end,
 			(long long)st.st_size, filename);
 	} else {
 		snprintf(head, sizeof(head),
-			"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: %lld\r\n"
+			"HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lld\r\n"
 			"Content-Disposition: inline; filename=\"%s\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+			has_suffix(filename, ".jpg") ? "image/jpeg" : "video/mp4",
 			(long long)remaining, filename);
 	}
 	send_all(fd, head, strlen(head));
@@ -1201,8 +1329,8 @@ static const char *index_html =
 "td,th{border-bottom:1px solid #ccc;padding:4px 6px;text-align:left}pre{background:#f5f5f5;padding:8px;overflow:auto}.small{color:#555}"
 "</style></head><body><h1>Camera Recorder</h1>"
 "<h2>Status</h2><pre id=s>loading...</pre>"
-"<p><button onclick=startRec()>Start Recording</button><button onclick=stopRec()>Stop Recording</button></p>"
-"<h2>Recordings</h2><table><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Actions</th></tr></thead><tbody id=r></tbody></table>"
+"<p><button onclick=startRec()>Start Recording</button><button onclick=stopRec()>Stop Recording</button><button onclick=captureFrame()>Capture Frame</button></p>"
+"<h2>Recordings</h2><table><thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Modified</th><th>Actions</th></tr></thead><tbody id=r></tbody></table>"
 "<h2>Clip Task</h2><pre id=t>loading...</pre>"
 "<p class=small>Clip input uses seconds. Playback is via the file links.</p>"
 "<script>"
@@ -1210,9 +1338,9 @@ static const char *index_html =
 "function size(n){return(n/1048576).toFixed(1)+' MiB'}"
 "function ts(v){return v?new Date(v*1000).toLocaleString():''}"
 "async function refresh(){let s=await api('/api/status');document.getElementById('s').textContent=JSON.stringify(s,null,2);"
-"let rs=await api('/api/recordings');document.getElementById('r').innerHTML=rs.map(x=>`<tr><td><a href=\"/recordings/${x.name}\">${x.name}</a></td><td>${size(x.size)}</td><td>${ts(x.mtime)}</td><td><button onclick=\"clip('${x.name}')\">Clip</button><button onclick=\"del('${x.name}')\">Delete</button></td></tr>`).join('');"
+"let rs=await api('/api/recordings');document.getElementById('r').innerHTML=rs.map(x=>`<tr><td><a target=\"_blank\" href=\"/recordings/${x.name}\">${x.name}</a></td><td>${x.type}</td><td>${size(x.size)}</td><td>${ts(x.mtime)}</td><td>${x.type=='video'?`<button onclick=\"clip('${x.name}')\">Clip</button>`:''}<button onclick=\"del('${x.name}')\">Delete</button></td></tr>`).join('');"
 "let t=await api('/api/clip/task');document.getElementById('t').textContent=JSON.stringify(t,null,2)}"
-"async function startRec(){await fetch('/api/record/start',{method:'POST'});refresh()}async function stopRec(){if(confirm('Stop recording?')){await fetch('/api/record/stop',{method:'POST'});refresh()}}"
+"async function startRec(){await fetch('/api/record/start',{method:'POST'});refresh()}async function stopRec(){if(confirm('Stop recording?')){await fetch('/api/record/stop',{method:'POST'});refresh()}}async function captureFrame(){let r=await fetch('/api/frame/capture',{method:'POST'});if(!r.ok)alert(await r.text());refresh()}"
 "async function del(n){if(confirm('Delete '+n+'?')){await fetch('/api/recordings/'+n,{method:'DELETE'});refresh()}}"
 "async function clip(n){let s=prompt('Start seconds','0');if(s==null)return;let e=prompt('End seconds','5');if(e==null)return;let a=confirm('Include audio? OK=yes Cancel=no');let r=await fetch('/api/recordings/'+n+'/clip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({start_ms:Math.round(+s*1000),end_ms:Math.round(+e*1000),audio:a})});if(!r.ok)alert(await r.text());refresh()}"
 "setInterval(refresh,1000);refresh();</script></body></html>";
@@ -1269,6 +1397,9 @@ static void handle_client(int fd)
 		http_reply(fd, rc, "application/json", rc == 200 ? "{\"ok\":true}" : "{\"ok\":false}");
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/record/stop") == 0) {
 		int rc = stop_recording();
+		http_reply(fd, rc, "application/json", rc == 200 ? "{\"ok\":true}" : "{\"ok\":false}");
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/frame/capture") == 0) {
+		int rc = capture_frame();
 		http_reply(fd, rc, "application/json", rc == 200 ? "{\"ok\":true}" : "{\"ok\":false}");
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/recordings") == 0) {
 		reply_recordings(fd);
@@ -1339,6 +1470,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "failed to initialize app directories/logs\n");
 		return 1;
 	}
+	set_record_led(false);
 	check_orphan_recorder_on_startup();
 
 	signal(SIGINT, signal_handler);
@@ -1405,6 +1537,11 @@ int main(int argc, char **argv)
 		client = accept(server_fd, NULL, NULL);
 		if (client < 0)
 			continue;
+		if (set_close_on_exec(client) != 0) {
+			log_msg("client FD_CLOEXEC failed: %s", strerror(errno));
+			close(client);
+			continue;
+		}
 		set_socket_timeouts(client);
 		handle_client(client);
 		close(client);
@@ -1414,6 +1551,13 @@ int main(int argc, char **argv)
 
 	if (g_rec_pid > 0)
 		stop_recording();
+	set_record_led(false);
+	if (g_frame_pid > 0) {
+		char frame_path[PATH_MAX];
+		kill(g_frame_pid, SIGTERM);
+		snprintf(frame_path, sizeof(frame_path), "%s/%s", RECORDINGS_DIR, g_frame_file);
+		unlink(frame_path);
+	}
 	if (g_clip_pid > 0)
 		kill(g_clip_pid, SIGTERM);
 	log_msg("server stop");
