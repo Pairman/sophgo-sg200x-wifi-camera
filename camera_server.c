@@ -81,6 +81,16 @@ static time_t g_clip_finished_at;
 
 static pid_t find_camera_stream_process(void);
 
+static bool name_is_camera_server(const char *name)
+{
+	return strcmp(name, "camera_server") == 0 || strcmp(name, "camera-server") == 0;
+}
+
+static bool name_is_camera_stream(const char *name)
+{
+	return strcmp(name, "camera_stream") == 0 || strcmp(name, "camera-stream") == 0;
+}
+
 static void set_last_error(const char *msg)
 {
 	snprintf(g_last_error, sizeof(g_last_error), "%s", msg != NULL ? msg : "");
@@ -314,6 +324,41 @@ static const char *clip_state_name(clip_state_t state)
 	}
 }
 
+static bool current_recording_file_exists(void)
+{
+	char path[PATH_MAX];
+	struct stat st;
+
+	if (g_current_file[0] == '\0')
+		return false;
+
+	snprintf(path, sizeof(path), "%s/%s", RECORDINGS_DIR, g_current_file);
+	return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static void update_recording_start_state(void)
+{
+	time_t now;
+
+	if (g_rec_state != REC_STARTING)
+		return;
+
+	if (current_recording_file_exists()) {
+		set_rec_state(REC_RECORDING);
+		set_last_error("");
+		log_msg("record file opened: %s", g_current_file);
+		return;
+	}
+
+	now = time(NULL);
+	if (g_rec_pid > 0 && g_started_at > 0 && now - g_started_at >= 10) {
+		log_msg("record start timed out; stopping pid=%ld file=%s", (long)g_rec_pid, g_current_file);
+		kill(g_rec_pid, SIGTERM);
+		set_rec_state(REC_ERROR);
+		set_last_error("recorder did not create output file");
+	}
+}
+
 static void poll_children(void)
 {
 	int status;
@@ -362,6 +407,8 @@ static void poll_children(void)
 		set_rec_state(REC_IDLE);
 		set_last_error("");
 	}
+
+	update_recording_start_state();
 }
 
 static void finish_recording_child(int status)
@@ -419,6 +466,10 @@ static int start_recording(void)
 		set_last_error("frame capture active");
 		return 409;
 	}
+	if (g_rec_pid > 0) {
+		set_last_error("recorder cleanup pending");
+		return 409;
+	}
 	if (g_rec_state == REC_STARTING || g_rec_state == REC_RECORDING || g_rec_state == REC_STOPPING) {
 		set_last_error("recording already active");
 		return 409;
@@ -464,9 +515,16 @@ static int start_recording(void)
 	}
 
 	g_rec_pid = pid;
-	set_rec_state(REC_RECORDING);
-	set_last_error("");
-	log_msg("record start success: pid=%ld file=%s", (long)pid, name);
+	set_last_error("recorder starting");
+	log_msg("record process started: pid=%ld file=%s", (long)pid, name);
+	for (int i = 0; i < 20; ++i) {
+		usleep(100 * 1000);
+		poll_children();
+		if (g_rec_state == REC_RECORDING)
+			break;
+		if (g_rec_state == REC_ERROR || g_rec_state == REC_IDLE)
+			return 500;
+	}
 	return 200;
 }
 
@@ -611,7 +669,7 @@ static bool pid_is_stale_camera_process(pid_t pid)
 	buf[n] = '\0';
 	if (strchr(buf, '\n') != NULL)
 		*strchr(buf, '\n') = '\0';
-	if (strcmp(buf, "camera_server") != 0 && strcmp(buf, "camera_stream") != 0)
+	if (!name_is_camera_server(buf) && !name_is_camera_stream(buf))
 		return false;
 
 	snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)pid);
@@ -629,7 +687,7 @@ static bool pid_is_stale_camera_process(pid_t pid)
 		if (buf[i] == '\0')
 			buf[i] = ' ';
 	}
-	return strstr(buf, "camera_server") != NULL || strstr(buf, "camera_stream") != NULL;
+	return strstr(buf, "camera-server") != NULL || strstr(buf, "camera-stream") != NULL;
 }
 
 static bool pid_is_camera_stream(pid_t pid)
@@ -651,7 +709,7 @@ static bool pid_is_camera_stream(pid_t pid)
 	buf[n] = '\0';
 	if (strchr(buf, '\n') != NULL)
 		*strchr(buf, '\n') = '\0';
-	if (strcmp(buf, "camera_stream") != 0)
+	if (!name_is_camera_stream(buf))
 		return false;
 
 	snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)pid);
@@ -669,7 +727,7 @@ static bool pid_is_camera_stream(pid_t pid)
 		if (buf[i] == '\0')
 			buf[i] = ' ';
 	}
-	return strstr(buf, "camera_stream") != NULL;
+	return strstr(buf, "camera-stream") != NULL;
 }
 
 static pid_t find_camera_stream_process(void)
