@@ -64,6 +64,7 @@ static rec_state_t g_rec_state = REC_IDLE;
 static pid_t g_rec_pid = -1;
 static char g_current_file[PATH_MAX];
 static time_t g_started_at;
+static time_t g_stop_requested_at;
 static char g_last_error[256];
 static FILE *g_log;
 
@@ -147,6 +148,10 @@ static void set_rec_state(rec_state_t state)
 {
 	g_rec_state = state;
 	set_record_led(state == REC_STARTING || state == REC_RECORDING || state == REC_STOPPING);
+	if (state == REC_IDLE || state == REC_ERROR) {
+		g_started_at = 0;
+		g_stop_requested_at = 0;
+	}
 }
 
 static void signal_handler(int signo)
@@ -352,6 +357,11 @@ static void poll_children(void)
 			g_frame_pid = -1;
 		}
 	}
+
+	if (g_rec_state == REC_STOPPING && g_rec_pid <= 0) {
+		set_rec_state(REC_IDLE);
+		set_last_error("");
+	}
 }
 
 static void finish_recording_child(int status)
@@ -433,9 +443,10 @@ static int start_recording(void)
 		BIN_DIR "/camera_stream",
 		"./camera_stream");
 
-	set_rec_state(REC_STARTING);
 	snprintf(g_current_file, sizeof(g_current_file), "%s", name);
 	g_started_at = time(NULL);
+	g_stop_requested_at = 0;
+	set_rec_state(REC_STARTING);
 	log_msg("record start requested: %s", name);
 
 	pid = fork();
@@ -512,12 +523,35 @@ static int stop_recording(void)
 	int rc;
 
 	poll_children();
+	if (g_rec_state == REC_STOPPING) {
+		if (g_rec_pid <= 0) {
+			set_rec_state(REC_IDLE);
+			set_last_error("");
+			return 200;
+		}
+		pid = g_rec_pid;
+		log_msg("record stop wait requested: pid=%ld file=%s", (long)pid, g_current_file);
+		rc = wait_recording_stopped(pid, 3000);
+		if (rc < 0) {
+			set_rec_state(REC_ERROR);
+			set_last_error("failed to wait recorder");
+			log_msg("record stop wait failed: %s", strerror(errno));
+			return 500;
+		}
+		if (rc > 0) {
+			set_last_error("recorder is stopping");
+			log_msg("record stop still pending: pid=%ld", (long)pid);
+		}
+		return 200;
+	}
+
 	if (g_rec_pid <= 0 || !(g_rec_state == REC_RECORDING || g_rec_state == REC_STARTING)) {
 		set_last_error("not recording");
 		return 409;
 	}
 
 	pid = g_rec_pid;
+	g_stop_requested_at = time(NULL);
 	set_rec_state(REC_STOPPING);
 	log_msg("record stop requested: pid=%ld file=%s", (long)pid, g_current_file);
 	if (kill(pid, SIGTERM) != 0) {
@@ -963,8 +997,12 @@ static void reply_status(int fd)
 
 	poll_children();
 	check_low_space_stop();
-	if (g_started_at > 0 && (g_rec_state == REC_RECORDING || g_rec_state == REC_STOPPING))
+	if (g_started_at > 0 && g_rec_state == REC_RECORDING) {
 		duration = (long)(now - g_started_at) * 1000L;
+	} else if (g_started_at > 0 && g_rec_state == REC_STOPPING) {
+		time_t end = g_stop_requested_at > 0 ? g_stop_requested_at : now;
+		duration = (long)(end - g_started_at) * 1000L;
+	}
 	json_escape(file, sizeof(file), g_current_file);
 	json_escape(err, sizeof(err), g_last_error);
 	snprintf(body, sizeof(body),
@@ -1110,6 +1148,11 @@ static int start_clip(const char *filename, const char *body)
 		return 400;
 	if (!has_suffix(filename, ".mp4"))
 		return 400;
+	if ((g_rec_pid > 0 || g_rec_state == REC_STARTING || g_rec_state == REC_RECORDING || g_rec_state == REC_STOPPING) &&
+	    strcmp(filename, g_current_file) == 0) {
+		log_msg("clip rejected: current recording is not finalized: %s", filename);
+		return 409;
+	}
 	if (!parse_json_long(body, "\"start_ms\"", &start_ms) ||
 	    !parse_json_long(body, "\"end_ms\"", &end_ms) ||
 	    start_ms < 0 || end_ms <= start_ms)
