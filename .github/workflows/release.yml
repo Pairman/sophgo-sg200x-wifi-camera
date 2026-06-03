@@ -26,7 +26,7 @@ jobs:
         with:
           tag_name: ${{ env.TAG }}
           name: ${{ env.TAG }}
-          token: ${{ github.token }}
+          token: ${{ secrets.GH_TOKEN }}
           files: |
             dist/wifi-camera.tar.gz
             dist/wifi-camera.tar.gz.sha256
