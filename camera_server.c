@@ -336,6 +336,17 @@ static bool current_recording_file_exists(void)
 	return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
+static bool current_recording_file_is_active(const char *name)
+{
+	if (name == NULL || g_current_file[0] == '\0' || strcmp(name, g_current_file) != 0)
+		return false;
+
+	return g_rec_pid > 0 ||
+		g_rec_state == REC_STARTING ||
+		g_rec_state == REC_RECORDING ||
+		g_rec_state == REC_STOPPING;
+}
+
 static void update_recording_start_state(void)
 {
 	time_t now;
@@ -1206,8 +1217,7 @@ static int start_clip(const char *filename, const char *body)
 		return 400;
 	if (!has_suffix(filename, ".mp4"))
 		return 400;
-	if ((g_rec_pid > 0 || g_rec_state == REC_STARTING || g_rec_state == REC_RECORDING || g_rec_state == REC_STOPPING) &&
-	    strcmp(filename, g_current_file) == 0) {
+	if (current_recording_file_is_active(filename)) {
 		log_msg("clip rejected: current recording is not finalized: %s", filename);
 		return 409;
 	}
@@ -1442,7 +1452,7 @@ static const char *index_html =
 "let rs=await api('/api/recordings');document.getElementById('r').innerHTML=rs.map(x=>`<tr><td><a target=\"_blank\" href=\"/recordings/${x.name}\">${x.name}</a></td><td>${x.type}</td><td>${size(x.size)}</td><td>${ts(x.mtime)}</td><td>${x.type=='video'?`<button onclick=\"clip('${x.name}')\">Clip</button>`:''}<button onclick=\"del('${x.name}')\">Delete</button></td></tr>`).join('');"
 "let t=await api('/api/clip/task');document.getElementById('t').textContent=JSON.stringify(t,null,2)}"
 "async function startRec(){await fetch('/api/record/start',{method:'POST'});refresh()}async function stopRec(){if(confirm('Stop recording?')){await fetch('/api/record/stop',{method:'POST'});refresh()}}async function captureFrame(){let r=await fetch('/api/frame/capture',{method:'POST'});if(!r.ok)alert(await r.text());refresh()}"
-"async function del(n){if(confirm('Delete '+n+'?')){await fetch('/api/recordings/'+n,{method:'DELETE'});refresh()}}"
+"async function del(n){if(confirm('Delete '+n+'?')){let r=await fetch('/api/recordings/'+n,{method:'DELETE'});if(!r.ok)alert(await r.text());refresh()}}"
 "async function clip(n){let s=prompt('Start seconds','0');if(s==null)return;let e=prompt('End seconds','5');if(e==null)return;let a=confirm('Include audio? OK=yes Cancel=no');let r=await fetch('/api/recordings/'+n+'/clip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({start_ms:Math.round(+s*1000),end_ms:Math.round(+e*1000),audio:a})});if(!r.ok)alert(await r.text());refresh()}"
 "setInterval(refresh,1000);refresh();</script></body></html>";
 
@@ -1509,8 +1519,11 @@ static void handle_client(int fd)
 	} else if (strcmp(method, "DELETE") == 0 && strncmp(path, "/api/recordings/", 16) == 0) {
 		char full[PATH_MAX];
 		const char *name = path + 16;
+
 		if (!safe_filename(name)) {
 			http_reply(fd, 400, "application/json", "{\"error\":\"bad filename\"}");
+		} else if (current_recording_file_is_active(name)) {
+			http_reply(fd, 409, "application/json", "{\"error\":\"recording file is active\"}");
 		} else {
 			snprintf(full, sizeof(full), "%s/%s", RECORDINGS_DIR, name);
 			if (unlink(full) == 0) {
