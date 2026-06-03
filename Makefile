@@ -10,6 +10,7 @@ PREFIX ?= /usr
 
 CC := $(CROSS_COMPILE)gcc
 CXX := $(CROSS_COMPILE)g++
+STRIP ?= $(CROSS_COMPILE)strip
 PKG_CONFIG ?= pkg-config
 
 chip_lc := $(shell echo $(CHIP_ARCH) | tr A-Z a-z)
@@ -20,7 +21,7 @@ KERNEL_INC ?= $(KERNEL_DIR)/riscv/usr/include
 MEDIA_SERVER_DIR := $(MIDDLEWARE_DIR)/sample/test_mmf/media_server-1.0.x
 
 COMMON_CFLAGS := \
-	-Os -g -std=gnu11 -Wall -Wextra -fPIC -ffunction-sections -fdata-sections \
+	-Os -g -std=gnu11 -Wall -Wextra -ffunction-sections -fdata-sections \
 	-mcpu=c906fdv -march=rv64imafdcv0p7xthead -mcmodel=medany -mabi=lp64d \
 	-DARCH_$(CHIP_ARCH) -D__CV181X__ -D__SOC_MARS__ \
 	-DSENSOR0_TYPE=SONY_IMX327_MIPI_2M_30FPS_12BIT \
@@ -39,7 +40,7 @@ COMMON_CFLAGS := \
 
 DEPFLAGS := -MMD
 CFLAGS += $(COMMON_CFLAGS)
-LDFLAGS += -Wl,--gc-sections -rdynamic -L$(MW_LIB) -L$(MW_3RD_LIB) \
+LDFLAGS += -Wl,--gc-sections -Wl,--as-needed -L$(MW_LIB) -L$(MW_3RD_LIB) \
 	-Wl,-rpath=/mnt/system/usr/lib -Wl,-rpath=/mnt/system/usr/lib/3rd
 
 PKG_CONFIG_PATH := $(MIDDLEWARE_DIR)/pkgconfig
@@ -62,10 +63,10 @@ camera_frame: camera_frame.o
 	$(CXX) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS)
 
 camera_stream: camera_stream.o
-	$(CXX) -o $@ $^ $(MEDIA_LIBS) -laacenc2 -laaccomm2 -laacsbrenc2 $(LDFLAGS) $(COMMON_LIBS)
+	$(CXX) -o $@ $^ $(LDFLAGS) $(MEDIA_LIBS) -laacenc2 -laaccomm2 -laacsbrenc2 $(COMMON_LIBS)
 
 camera_clip: camera_clip.o
-	$(CXX) -o $@ $^ $(MEDIA_SERVER_DIR)/release.linux/libmov.a $(LDFLAGS) -lm -ldl -lpthread -lstdc++
+	$(CXX) -o $@ $^ $(LDFLAGS) $(MEDIA_SERVER_DIR)/release.linux/libmov.a -lm -ldl -lpthread -lstdc++
 
 camera_server: camera_server.o
 	$(CXX) -o $@ $^ $(LDFLAGS) -lpthread -lm -ldl -lstdc++
@@ -81,6 +82,11 @@ install: all
 	install -m 0755 camera_server $(DESTDIR)$(PREFIX)/bin/camera-server
 	install -m 0755 camera_clip $(DESTDIR)$(PREFIX)/libexec/wifi-camera/camera_clip
 	install -m 0644 camera-server.service $(DESTDIR)$(PREFIX)/lib/systemd/system/camera-server.service
+	$(STRIP) --strip-unneeded \
+		$(DESTDIR)$(PREFIX)/bin/camera-frame \
+		$(DESTDIR)$(PREFIX)/bin/camera-stream \
+		$(DESTDIR)$(PREFIX)/bin/camera-server \
+		$(DESTDIR)$(PREFIX)/libexec/wifi-camera/camera_clip
 
 clean:
 	rm -f $(TARGETS) $(OBJS) $(DEPS)
