@@ -34,6 +34,8 @@
 #define MAX_REQ 8192
 #define MAX_BODY 4096
 #define MAX_FILES 256
+#define MAX_FILE_CHILDREN 8
+#define FILE_RANGE_CHUNK_BYTES (2 * 1024 * 1024)
 #define RECORD_SECONDS 31536000
 
 typedef enum {
@@ -78,6 +80,7 @@ static char g_clip_output[NAME_MAX + 1];
 static char g_clip_error[256];
 static time_t g_clip_started_at;
 static time_t g_clip_finished_at;
+static int g_file_children;
 
 static pid_t find_camera_stream_process(void);
 
@@ -411,6 +414,8 @@ static void poll_children(void)
 				set_last_error("frame capture failed");
 			}
 			g_frame_pid = -1;
+		} else if (g_file_children > 0) {
+			--g_file_children;
 		}
 	}
 
@@ -1030,6 +1035,7 @@ static void http_reply(int fd, int code, const char *type, const char *body)
 	else if (code == 405) status = "Method Not Allowed";
 	else if (code == 409) status = "Conflict";
 	else if (code == 500) status = "Internal Server Error";
+	else if (code == 503) status = "Service Unavailable";
 	else if (code == 507) status = "Insufficient Storage";
 
 	snprintf(head, sizeof(head),
@@ -1333,7 +1339,7 @@ static void send_file_range_not_satisfiable(int fd, off_t file_size)
 	send_all(fd, head, strlen(head));
 }
 
-static void send_file(int fd, const char *filename, const char *req)
+static void send_file(int fd, const char *method, const char *filename, const char *req)
 {
 	char path[PATH_MAX];
 	char head[768];
@@ -1344,6 +1350,7 @@ static void send_file(int fd, const char *filename, const char *req)
 	off_t end;
 	off_t remaining;
 	bool partial = false;
+	bool head_only = strcmp(method, "HEAD") == 0;
 	ssize_t n;
 
 	if (!safe_filename(filename)) {
@@ -1378,6 +1385,8 @@ static void send_file(int fd, const char *filename, const char *req)
 		}
 		partial = true;
 	}
+	if (partial && has_suffix(filename, ".mp4") && end - start + 1 > FILE_RANGE_CHUNK_BYTES)
+		end = start + FILE_RANGE_CHUNK_BYTES - 1;
 
 	if (lseek(in, start, SEEK_SET) < 0) {
 		close(in);
@@ -1402,6 +1411,10 @@ static void send_file(int fd, const char *filename, const char *req)
 			(long long)remaining, filename);
 	}
 	send_all(fd, head, strlen(head));
+	if (head_only) {
+		close(in);
+		return;
+	}
 
 	while (remaining > 0) {
 		size_t want = remaining > (off_t)sizeof(buf) ? sizeof(buf) : (size_t)remaining;
@@ -1414,9 +1427,17 @@ static void send_file(int fd, const char *filename, const char *req)
 	close(in);
 }
 
-static void send_file_in_child(int fd, const char *filename, const char *req)
+static void send_file_in_child(int fd, const char *method, const char *filename, const char *req)
 {
-	pid_t pid = fork();
+	pid_t pid;
+
+	poll_children();
+	if (g_file_children >= MAX_FILE_CHILDREN) {
+		http_reply(fd, 503, "application/json", "{\"error\":\"too many file requests\"}");
+		return;
+	}
+
+	pid = fork();
 
 	if (pid < 0) {
 		http_reply(fd, 500, "application/json", "{\"error\":\"fork failed\"}");
@@ -1427,10 +1448,11 @@ static void send_file_in_child(int fd, const char *filename, const char *req)
 		if (g_server_fd >= 0)
 			close(g_server_fd);
 		set_socket_timeouts(fd);
-		send_file(fd, filename, req);
+		send_file(fd, method, filename, req);
 		close(fd);
 		_exit(0);
 	}
+	++g_file_children;
 }
 
 static const char *index_html =
@@ -1514,8 +1536,9 @@ static void handle_client(int fd)
 		http_reply(fd, rc, "application/json", rc == 200 ? "{\"ok\":true}" : "{\"ok\":false}");
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/recordings") == 0) {
 		reply_recordings(fd);
-	} else if (strcmp(method, "GET") == 0 && strncmp(path, "/recordings/", 12) == 0) {
-		send_file_in_child(fd, path + 12, req);
+	} else if ((strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) &&
+	    strncmp(path, "/recordings/", 12) == 0) {
+		send_file_in_child(fd, method, path + 12, req);
 	} else if (strcmp(method, "DELETE") == 0 && strncmp(path, "/api/recordings/", 16) == 0) {
 		char full[PATH_MAX];
 		const char *name = path + 16;
