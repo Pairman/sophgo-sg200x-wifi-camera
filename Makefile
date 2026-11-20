@@ -75,6 +75,7 @@ install: all
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -d $(DESTDIR)$(PREFIX)/libexec/wifi-camera
 	install -d $(DESTDIR)$(PREFIX)/lib/systemd/system
+	install -d $(DESTDIR)$(PREFIX)/share/wifi-camera
 	install -d $(DESTDIR)/var/lib/wifi-camera/recordings
 	install -d $(DESTDIR)/var/log/wifi-camera
 	install -m 0755 camera_frame $(DESTDIR)$(PREFIX)/bin/camera-frame
@@ -82,6 +83,8 @@ install: all
 	install -m 0755 camera_server $(DESTDIR)$(PREFIX)/bin/camera-server
 	install -m 0755 camera_clip $(DESTDIR)$(PREFIX)/libexec/wifi-camera/camera_clip
 	install -m 0644 camera-server.service $(DESTDIR)$(PREFIX)/lib/systemd/system/camera-server.service
+	install -m 0644 web/index.html $(DESTDIR)$(PREFIX)/share/wifi-camera/index.html
+	install -m 0644 web/ANDROID-IP-CAMERA-LICENSE $(DESTDIR)$(PREFIX)/share/wifi-camera/ANDROID-IP-CAMERA-LICENSE
 	$(STRIP) --strip-unneeded \
 		$(DESTDIR)$(PREFIX)/bin/camera-frame \
 		$(DESTDIR)$(PREFIX)/bin/camera-stream \

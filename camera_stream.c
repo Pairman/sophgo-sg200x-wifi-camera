@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -43,10 +44,12 @@
 #define AUDIO_SAMPLES_PER_FRAME AACENC_BLOCKSIZE
 #define AUDIO_BITRATE 32000
 #define AUDIO_VOLUME 24
+#define AUDIO_PCM_QUEUE_CAPACITY 8
 #define OPT_SENSOR_TYPE GCORE_GC4653_MIPI_720P_60FPS_10BIT
 #define GC4653_VTS_H_ADDR 0x0340
 #define GC4653_VTS_L_ADDR 0x0341
-#define GC4653_720P25_VTS 3600
+/* 720p sensor mode: 750 VTS at 60 fps, so 1800 VTS gives 25 fps. */
+#define GC4653_720P25_VTS 1800
 
 extern int gc4653_write_register(VI_PIPE ViPipe, int addr, int data);
 extern int gc4653_read_register(VI_PIPE ViPipe, int addr);
@@ -62,7 +65,22 @@ static int g_fmp4_track = -1;
 static int g_audio_track = -1;
 static CVI_U32 g_fmp4_frame_index;
 static CVI_U64 g_audio_sample_index;
+static CVI_S16 g_audio_pcm_queue[AUDIO_PCM_QUEUE_CAPACITY][AUDIO_SAMPLES_PER_FRAME];
+static unsigned g_audio_queue_head;
+static unsigned g_audio_queue_count;
+static bool g_audio_thread_started;
+static bool g_audio_thread_stop;
+static CVI_S32 g_audio_thread_error;
+static pthread_t g_audio_thread;
+static pthread_mutex_t g_audio_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_audio_queue_cond = PTHREAD_COND_INITIALIZER;
+
+static void *audio_capture_thread(void *unused);
 static volatile sig_atomic_t g_stop;
+static bool g_audio_enabled;
+static bool g_mode_1440p;
+static CVI_U32 g_stream_width = STREAM_WIDTH;
+static CVI_U32 g_stream_height = STREAM_HEIGHT;
 
 static bool g_sys_ready;
 static bool g_vi_ready;
@@ -72,6 +90,15 @@ static bool g_venc_fd_open;
 
 static void cleanup(void)
 {
+	if (g_audio_thread_started) {
+		pthread_mutex_lock(&g_audio_queue_mutex);
+		g_audio_thread_stop = true;
+		pthread_cond_broadcast(&g_audio_queue_cond);
+		pthread_mutex_unlock(&g_audio_queue_mutex);
+		pthread_join(g_audio_thread, NULL);
+		g_audio_thread_started = false;
+	}
+
 	if (g_fmp4 != NULL) {
 		fmp4_writer_destroy(g_fmp4);
 		g_fmp4 = NULL;
@@ -171,8 +198,9 @@ static CVI_S32 init_sys_and_vi(void)
 	if (ret != CVI_SUCCESS)
 		return ret;
 
-	ini_config.enSnsType[0] = OPT_SENSOR_TYPE;
-	SAMPLE_PRT("Override sensor mode: GCORE_GC4653_MIPI_720P_60FPS_10BIT\n");
+	ini_config.enSnsType[0] = g_mode_1440p ? GCORE_GC4653_MIPI_4M_30FPS_10BIT : OPT_SENSOR_TYPE;
+	SAMPLE_PRT("Override sensor mode: %s\n", g_mode_1440p ?
+		"GCORE_GC4653_MIPI_4M_30FPS_10BIT" : "GCORE_GC4653_MIPI_720P_60FPS_10BIT");
 	CVI_VI_SetDevNum(ini_config.devNum);
 
 	ret = SAMPLE_COMM_VI_IniToViCfg(&ini_config, &vi_config);
@@ -219,11 +247,11 @@ static CVI_S32 init_venc(int frame_count)
 
 	memset(&attr, 0, sizeof(attr));
 	attr.stVencAttr.enType = PT_H264;
-	attr.stVencAttr.u32MaxPicWidth = STREAM_WIDTH;
-	attr.stVencAttr.u32MaxPicHeight = STREAM_HEIGHT;
-	attr.stVencAttr.u32PicWidth = STREAM_WIDTH;
-	attr.stVencAttr.u32PicHeight = STREAM_HEIGHT;
-	attr.stVencAttr.u32BufSize = STREAM_WIDTH * STREAM_HEIGHT;
+	attr.stVencAttr.u32MaxPicWidth = g_stream_width;
+	attr.stVencAttr.u32MaxPicHeight = g_stream_height;
+	attr.stVencAttr.u32PicWidth = g_stream_width;
+	attr.stVencAttr.u32PicHeight = g_stream_height;
+	attr.stVencAttr.u32BufSize = g_stream_width * g_stream_height;
 	attr.stVencAttr.u32Profile = 66;
 	attr.stVencAttr.bByFrame = CVI_TRUE;
 	attr.stVencAttr.bSingleCore = CVI_TRUE;
@@ -390,7 +418,72 @@ static CVI_S32 init_audio(void)
 	return CVI_SUCCESS;
 }
 
-static CVI_S32 drain_audio_until(CVI_U64 max_pts_ms)
+static CVI_S32 start_audio_capture(void)
+{
+	int ret;
+	if (!g_audio_enabled || g_audio_thread_started)
+		return CVI_SUCCESS;
+	g_audio_thread_stop = false;
+	g_audio_thread_error = CVI_SUCCESS;
+	g_audio_queue_head = 0;
+	g_audio_queue_count = 0;
+	ret = pthread_create(&g_audio_thread, NULL, audio_capture_thread, NULL);
+	if (ret != 0)
+		return CVI_FAILURE;
+	g_audio_thread_started = true;
+	return CVI_SUCCESS;
+}
+
+static void *audio_capture_thread(void *unused)
+{
+	CVI_S16 samples[AUDIO_SAMPLES_PER_FRAME];
+	(void)unused;
+
+	for (;;) {
+		CVI_S32 ret = pcm_read(g_audio_pcm, samples, sizeof(samples));
+		pthread_mutex_lock(&g_audio_queue_mutex);
+		if (ret != CVI_SUCCESS) {
+			g_audio_thread_error = ret;
+			pthread_cond_broadcast(&g_audio_queue_cond);
+			pthread_mutex_unlock(&g_audio_queue_mutex);
+			break;
+		}
+		while (g_audio_queue_count == AUDIO_PCM_QUEUE_CAPACITY && !g_audio_thread_stop)
+			pthread_cond_wait(&g_audio_queue_cond, &g_audio_queue_mutex);
+		if (g_audio_thread_stop) {
+			pthread_mutex_unlock(&g_audio_queue_mutex);
+			break;
+		}
+		unsigned tail = (g_audio_queue_head + g_audio_queue_count) % AUDIO_PCM_QUEUE_CAPACITY;
+		memcpy(g_audio_pcm_queue[tail], samples, sizeof(samples));
+		++g_audio_queue_count;
+		pthread_cond_broadcast(&g_audio_queue_cond);
+		pthread_mutex_unlock(&g_audio_queue_mutex);
+	}
+	return NULL;
+}
+
+static CVI_S32 get_audio_pcm_frame(CVI_S16 *samples, bool wait)
+{
+	CVI_S32 ret = CVI_SUCCESS;
+	pthread_mutex_lock(&g_audio_queue_mutex);
+	while (wait && g_audio_queue_count == 0 && g_audio_thread_error == CVI_SUCCESS && !g_audio_thread_stop)
+		pthread_cond_wait(&g_audio_queue_cond, &g_audio_queue_mutex);
+	if (g_audio_queue_count == 0) {
+		ret = g_audio_thread_error != CVI_SUCCESS ? g_audio_thread_error :
+			(g_audio_thread_stop ? CVI_FAILURE : 1);
+	} else {
+		memcpy(samples, g_audio_pcm_queue[g_audio_queue_head],
+			sizeof(g_audio_pcm_queue[g_audio_queue_head]));
+		g_audio_queue_head = (g_audio_queue_head + 1) % AUDIO_PCM_QUEUE_CAPACITY;
+		--g_audio_queue_count;
+		pthread_cond_broadcast(&g_audio_queue_cond);
+	}
+	pthread_mutex_unlock(&g_audio_queue_mutex);
+	return ret;
+}
+
+static CVI_S32 drain_audio_until(CVI_U64 max_pts_ms, bool wait_for_pcm)
 {
 	CVI_S16 pcm_samples[AUDIO_SAMPLES_PER_FRAME];
 	CVI_U8 encoded[20480];
@@ -403,7 +496,9 @@ static CVI_S32 drain_audio_until(CVI_U64 max_pts_ms)
 	CVI_S32 ret;
 
 	while ((g_audio_sample_index * 1000) / AUDIO_SAMPLE_RATE <= max_pts_ms) {
-		ret = pcm_read(g_audio_pcm, pcm_samples, sizeof(pcm_samples));
+		ret = get_audio_pcm_frame(pcm_samples, wait_for_pcm);
+		if (ret == 1)
+			break;
 		if (ret != CVI_SUCCESS)
 			return ret;
 
@@ -479,7 +574,7 @@ static CVI_S32 write_fmp4_frame(const CVI_U8 *annexb, size_t annexb_bytes)
 		}
 
 		g_fmp4_track = fmp4_writer_add_video(g_fmp4, MOV_OBJECT_H264,
-			STREAM_WIDTH, STREAM_HEIGHT, extra_data, extra_data_bytes);
+			g_stream_width, g_stream_height, extra_data, extra_data_bytes);
 		if (g_fmp4_track < 0) {
 			ret = CVI_FAILURE;
 			goto out;
@@ -582,17 +677,18 @@ static CVI_S32 set_sensor_25fps(void)
 {
 	int vts_h;
 	int vts_l;
+	CVI_U32 vts = g_mode_1440p ? 1800 : GC4653_720P25_VTS;
 	CVI_S32 ret;
 
 	vts_h = gc4653_read_register(0, GC4653_VTS_H_ADDR);
 	vts_l = gc4653_read_register(0, GC4653_VTS_L_ADDR);
 	SAMPLE_PRT("GC4653 VTS before 25fps set: 0x%02x 0x%02x\n", vts_h & 0xff, vts_l & 0xff);
 
-	ret = gc4653_write_register(0, GC4653_VTS_H_ADDR, (GC4653_720P25_VTS >> 8) & 0xff);
+	ret = gc4653_write_register(0, GC4653_VTS_H_ADDR, (vts >> 8) & 0xff);
 	if (ret != CVI_SUCCESS)
 		return ret;
 
-	ret = gc4653_write_register(0, GC4653_VTS_L_ADDR, GC4653_720P25_VTS & 0xff);
+	ret = gc4653_write_register(0, GC4653_VTS_L_ADDR, vts & 0xff);
 	if (ret != CVI_SUCCESS)
 		return ret;
 
@@ -621,9 +717,11 @@ static CVI_S32 capture_stream(const char *path, int seconds)
 	if (ret != CVI_SUCCESS)
 		return ret;
 
-	ret = init_audio();
-	if (ret != CVI_SUCCESS)
-		return ret;
+	if (g_audio_enabled) {
+		ret = init_audio();
+		if (ret != CVI_SUCCESS)
+			return ret;
+	}
 
 	usleep(800 * 1000);
 	ret = get_vi_frame(&warmup_frame);
@@ -635,19 +733,26 @@ static CVI_S32 capture_stream(const char *path, int seconds)
 	ret = set_sensor_25fps();
 	if (ret != CVI_SUCCESS)
 		goto out;
+	if (g_audio_enabled) {
+		ret = start_audio_capture();
+		if (ret != CVI_SUCCESS)
+			goto out;
+	}
 
 	for (int i = 0; i < frame_count && !g_stop; ++i) {
 		ret = encode_one_frame();
 		if (ret != CVI_SUCCESS)
 			goto out;
 
-		ret = drain_audio_until((CVI_U64)(i + 1) * STREAM_FRAME_MS);
-		if (ret != CVI_SUCCESS)
-			goto out;
+		if (g_audio_enabled) {
+			ret = drain_audio_until((CVI_U64)(i + 1) * STREAM_FRAME_MS, false);
+			if (ret != CVI_SUCCESS)
+				goto out;
+		}
 	}
 
-	if (!g_stop)
-		ret = drain_audio_until((CVI_U64)seconds * 1000);
+	if (g_audio_enabled && !g_stop)
+		ret = drain_audio_until((CVI_U64)seconds * 1000, true);
 
 out:
 	return ret;
@@ -655,7 +760,7 @@ out:
 
 static void usage(const char *program)
 {
-	fprintf(stderr, "Usage: %s -s <seconds>\n", program);
+	fprintf(stderr, "Usage: %s -s <seconds> [-a] [-r 720p|1440p]\n", program);
 }
 
 int main(int argc, char **argv)
@@ -668,7 +773,7 @@ int main(int argc, char **argv)
 	int opt;
 	CVI_S32 ret;
 
-	while ((opt = getopt(argc, argv, "s:o:")) != -1) {
+	while ((opt = getopt(argc, argv, "s:o:ar:")) != -1) {
 		switch (opt) {
 		case 's':
 			errno = 0;
@@ -680,6 +785,23 @@ int main(int argc, char **argv)
 			break;
 		case 'o':
 			requested_output = optarg;
+			break;
+		case 'a':
+			g_audio_enabled = true;
+			break;
+		case 'r':
+			if (strcmp(optarg, "720p") == 0) {
+				g_mode_1440p = false;
+				g_stream_width = 1280;
+				g_stream_height = 720;
+			} else if (strcmp(optarg, "1440p") == 0) {
+				g_mode_1440p = true;
+				g_stream_width = 2560;
+				g_stream_height = 1440;
+			} else {
+				usage(argv[0]);
+				return 1;
+			}
 			break;
 		default:
 			usage(argv[0]);

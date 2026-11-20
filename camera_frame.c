@@ -28,7 +28,8 @@
 #define OPT_SENSOR_TYPE GCORE_GC4653_MIPI_720P_60FPS_10BIT
 #define GC4653_VTS_H_ADDR 0x0340
 #define GC4653_VTS_L_ADDR 0x0341
-#define GC4653_720P25_VTS 3600
+#define GC4653_720P25_VTS 1800
+#define GC4653_720P_PREVIEW_VTS 16364
 
 extern int gc4653_write_register(VI_PIPE ViPipe, int addr, int data);
 extern int gc4653_read_register(VI_PIPE ViPipe, int addr);
@@ -41,6 +42,7 @@ static bool g_venc_created;
 static bool g_venc_receiving;
 static bool g_venc_fd_open;
 static CVI_S32 g_venc_fd = -1;
+static bool g_mode_1440p;
 
 static void cleanup(void)
 {
@@ -143,8 +145,9 @@ static CVI_S32 camera_init(CVI_U32 *width, CVI_U32 *height)
 	if (ret != CVI_SUCCESS)
 		return ret;
 
-	ini_config.enSnsType[0] = OPT_SENSOR_TYPE;
-	SAMPLE_PRT("Override sensor mode: GCORE_GC4653_MIPI_720P_60FPS_10BIT\n");
+	ini_config.enSnsType[0] = g_mode_1440p ? GCORE_GC4653_MIPI_4M_30FPS_10BIT : OPT_SENSOR_TYPE;
+	SAMPLE_PRT("Override sensor mode: %s\n", g_mode_1440p ?
+		"GCORE_GC4653_MIPI_4M_30FPS_10BIT" : "GCORE_GC4653_MIPI_720P_60FPS_10BIT");
 	CVI_VI_SetDevNum(ini_config.devNum);
 
 	ret = SAMPLE_COMM_VI_IniToViCfg(&ini_config, &vi_config);
@@ -189,16 +192,17 @@ static CVI_S32 camera_init(CVI_U32 *width, CVI_U32 *height)
 static CVI_S32 set_sensor_25fps(void)
 {
 	CVI_S32 ret;
+	CVI_U32 vts = g_mode_1440p ? 1800 : GC4653_720P25_VTS;
 
 	SAMPLE_PRT("GC4653 VTS before 25fps set: 0x%02x 0x%02x\n",
 		gc4653_read_register(0, GC4653_VTS_H_ADDR) & 0xff,
 		gc4653_read_register(0, GC4653_VTS_L_ADDR) & 0xff);
 
-	ret = gc4653_write_register(0, GC4653_VTS_H_ADDR, (GC4653_720P25_VTS >> 8) & 0xff);
+	ret = gc4653_write_register(0, GC4653_VTS_H_ADDR, (vts >> 8) & 0xff);
 	if (ret != CVI_SUCCESS)
 		return ret;
 
-	ret = gc4653_write_register(0, GC4653_VTS_L_ADDR, GC4653_720P25_VTS & 0xff);
+	ret = gc4653_write_register(0, GC4653_VTS_L_ADDR, vts & 0xff);
 	if (ret != CVI_SUCCESS)
 		return ret;
 
@@ -353,7 +357,7 @@ static CVI_S32 discard_warmup_frame(void)
 	return ret;
 }
 
-static CVI_S32 capture_frame(const char *output_path)
+static CVI_S32 capture_frame_once(const char *output_path)
 {
 	VIDEO_FRAME_INFO_S frame;
 	CVI_U32 width;
@@ -397,9 +401,84 @@ static CVI_S32 capture_frame(const char *output_path)
 	return ret;
 }
 
+static CVI_S32 set_sensor_preview_rate(void)
+{
+	CVI_U32 vts = GC4653_720P_PREVIEW_VTS;
+	CVI_S32 ret;
+	ret = gc4653_write_register(0, GC4653_VTS_H_ADDR, (vts >> 8) & 0xff);
+	if (ret != CVI_SUCCESS)
+		return ret;
+	return gc4653_write_register(0, GC4653_VTS_L_ADDR, vts & 0xff);
+}
+
+static CVI_S32 capture_preview(const char *output_path)
+{
+	VIDEO_FRAME_INFO_S frame;
+	CVI_U32 width;
+	CVI_U32 height;
+	char temp_path[PATH_MAX];
+	CVI_S32 ret;
+
+	if (snprintf(temp_path, sizeof(temp_path), "%s.tmp", output_path) >= (int)sizeof(temp_path))
+		return CVI_FAILURE;
+	/* A failed mode start must never leave an older frame looking current. */
+	unlink(output_path);
+	unlink(temp_path);
+	ret = camera_init(&width, &height);
+	if (ret != CVI_SUCCESS)
+		return ret;
+	ret = venc_init(width, height);
+	if (ret != CVI_SUCCESS)
+		return ret;
+	usleep(800 * 1000);
+	ret = discard_warmup_frame();
+	if (ret != CVI_SUCCESS)
+		return ret;
+	ret = set_sensor_preview_rate();
+	if (ret != CVI_SUCCESS)
+		return ret;
+
+	while (!g_stop) {
+		memset(&frame, 0, sizeof(frame));
+		ret = CVI_VI_GetChnFrame(FRAME_VI_DEV, FRAME_VI_CHN, &frame, 1000);
+		if (ret != CVI_SUCCESS)
+			return ret;
+		ret = CVI_VENC_SendFrame(FRAME_VENC_CHN, &frame, 1000);
+		if (ret == CVI_SUCCESS)
+			ret = save_jpeg_stream(temp_path);
+		CVI_S32 release_ret = CVI_VI_ReleaseChnFrame(FRAME_VI_DEV, FRAME_VI_CHN, &frame);
+		if (release_ret != CVI_SUCCESS) {
+			CVI_TRACE_LOG(CVI_DBG_ERR, "preview CVI_VI_ReleaseChnFrame failed: %#x\n", release_ret);
+			if (ret == CVI_SUCCESS)
+				ret = release_ret;
+		}
+		if (ret != CVI_SUCCESS)
+			return ret;
+		if (rename(temp_path, output_path) != 0)
+			return CVI_FAILURE;
+		/* The sensor runs at its lowest documented mode; publish at 1 fps. */
+		for (int i = 0; i < 10 && !g_stop; ++i)
+			usleep(100 * 1000);
+		if (!g_stop) {
+			ret = CVI_VENC_StopRecvFrame(FRAME_VENC_CHN);
+			if (ret != CVI_SUCCESS) {
+				CVI_TRACE_LOG(CVI_DBG_ERR, "preview CVI_VENC_StopRecvFrame failed: %#x\n", ret);
+				return ret;
+			}
+			VENC_RECV_PIC_PARAM_S recv_param;
+			memset(&recv_param, 0, sizeof(recv_param));
+			recv_param.s32RecvPicNum = 1;
+			ret = CVI_VENC_StartRecvFrame(FRAME_VENC_CHN, &recv_param);
+			if (ret != CVI_SUCCESS)
+				return ret;
+		}
+	}
+	return CVI_SUCCESS;
+}
+
 static void usage(const char *program)
 {
-	fprintf(stderr, "Usage: %s [-o output.jpg]\n", program);
+	fprintf(stderr, "Usage: %s [-o output.jpg] [-p preview.jpg] [-r 720p|1440p]\n", program);
 }
 
 int main(int argc, char **argv)
@@ -408,6 +487,7 @@ int main(int argc, char **argv)
 	time_t now;
 	CVI_S32 ret;
 	int opt;
+	bool preview = false;
 
 	now = time(NULL);
 	if (now == (time_t)-1) {
@@ -417,7 +497,7 @@ int main(int argc, char **argv)
 
 	snprintf(output_path, sizeof(output_path), "frame_%lld.jpg", (long long)now);
 
-	while ((opt = getopt(argc, argv, "o:")) != -1) {
+	while ((opt = getopt(argc, argv, "o:p:r:")) != -1) {
 		switch (opt) {
 		case 'o':
 			if (optarg[0] == '\0') {
@@ -426,6 +506,23 @@ int main(int argc, char **argv)
 			}
 			if (snprintf(output_path, sizeof(output_path), "%s", optarg) >= (int)sizeof(output_path)) {
 				fprintf(stderr, "output path too long\n");
+				return 1;
+			}
+			break;
+		case 'p':
+			if (optarg[0] == '\0' || snprintf(output_path, sizeof(output_path), "%s", optarg) >= (int)sizeof(output_path)) {
+				usage(argv[0]);
+				return 1;
+			}
+			preview = true;
+			break;
+		case 'r':
+			if (strcmp(optarg, "720p") == 0)
+				g_mode_1440p = false;
+			else if (strcmp(optarg, "1440p") == 0)
+				g_mode_1440p = true;
+			else {
+				usage(argv[0]);
 				return 1;
 			}
 			break;
@@ -439,7 +536,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	ret = capture_frame(output_path);
+	ret = preview ? capture_preview(output_path) : capture_frame_once(output_path);
 	cleanup();
 
 	return ret == CVI_SUCCESS ? 0 : 1;

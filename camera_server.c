@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
@@ -27,6 +28,7 @@
 #define SYSTEM_BIN_DIR "/usr/bin"
 #define LIBEXEC_DIR "/usr/libexec/wifi-camera"
 #define RECORDINGS_DIR APP_DIR "/recordings"
+#define PREVIEW_FILE APP_DIR "/preview.jpg"
 #define LOG_DIR "/var/log/wifi-camera"
 #define LED_TRIGGER_PATH "/sys/class/leds/led-user/trigger"
 #define LED_BRIGHTNESS_PATH "/sys/class/leds/led-user/brightness"
@@ -62,6 +64,7 @@ typedef struct {
 static volatile sig_atomic_t g_shutdown;
 static int g_server_fd = -1;
 static int g_server_port = DEFAULT_SERVER_PORT;
+static bool g_mode_1440p;
 static rec_state_t g_rec_state = REC_IDLE;
 static pid_t g_rec_pid = -1;
 static char g_current_file[PATH_MAX];
@@ -72,6 +75,9 @@ static FILE *g_log;
 
 static pid_t g_frame_pid = -1;
 static char g_frame_file[NAME_MAX + 1];
+static pid_t g_preview_pid = -1;
+static time_t g_preview_last_request;
+static time_t g_preview_retry_after;
 
 static clip_state_t g_clip_state = CLIP_NONE;
 static pid_t g_clip_pid = -1;
@@ -304,6 +310,52 @@ static void find_executable(char *out, size_t size, const char *system_path,
 	}
 }
 
+static void stop_preview(void)
+{
+	int status;
+	if (g_preview_pid <= 0)
+		return;
+	kill(g_preview_pid, SIGTERM);
+	for (int i = 0; i < 30; ++i) {
+		pid_t rc = waitpid(g_preview_pid, &status, WNOHANG);
+		if (rc == g_preview_pid || (rc < 0 && errno == ECHILD)) {
+			g_preview_pid = -1;
+			return;
+		}
+		usleep(50 * 1000);
+	}
+	kill(g_preview_pid, SIGKILL);
+	waitpid(g_preview_pid, &status, 0);
+	g_preview_pid = -1;
+}
+
+static int start_preview(void)
+{
+	char exe[PATH_MAX];
+	const char *resolution = g_mode_1440p ? "1440p" : "720p";
+	if (g_preview_pid > 0)
+		return 0;
+	if (time(NULL) < g_preview_retry_after)
+		return -1;
+	unlink(PREVIEW_FILE);
+	unlink(PREVIEW_FILE ".tmp");
+	find_executable(exe, sizeof(exe), SYSTEM_BIN_DIR "/camera-frame",
+		BIN_DIR "/camera_frame", "./camera_frame");
+	g_preview_pid = fork();
+	if (g_preview_pid < 0) {
+		g_preview_pid = -1;
+		g_preview_retry_after = time(NULL) + 5;
+		return -1;
+	}
+	if (g_preview_pid == 0) {
+		setpriority(PRIO_PROCESS, 0, 10);
+		execl(exe, exe, "-p", PREVIEW_FILE, "-r", resolution, (char *)NULL);
+		_exit(127);
+	}
+	log_msg("on-demand preview process started: pid=%ld", (long)g_preview_pid);
+	return 0;
+}
+
 static const char *state_name(rec_state_t state)
 {
 	switch (state) {
@@ -414,6 +466,11 @@ static void poll_children(void)
 				set_last_error("frame capture failed");
 			}
 			g_frame_pid = -1;
+		} else if (pid == g_preview_pid) {
+			log_msg("preview process stopped: pid=%ld status=%d", (long)pid, status);
+			g_preview_pid = -1;
+			if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+				g_preview_retry_after = time(NULL) + 5;
 		} else if (g_file_children > 0) {
 			--g_file_children;
 		}
@@ -469,7 +526,7 @@ static int wait_recording_stopped(pid_t pid, int timeout_ms)
 	return 1;
 }
 
-static int start_recording(void)
+static int start_recording(bool audio_enabled)
 {
 	char name[NAME_MAX + 1];
 	char path[PATH_MAX];
@@ -478,6 +535,7 @@ static int start_recording(void)
 	pid_t existing;
 
 	poll_children();
+	stop_preview();
 	if (g_frame_pid > 0) {
 		set_last_error("frame capture active");
 		return 409;
@@ -525,8 +583,11 @@ static int start_recording(void)
 	}
 	if (pid == 0) {
 		char seconds[32];
+		const char *resolution = g_mode_1440p ? "1440p" : "720p";
 		snprintf(seconds, sizeof(seconds), "%d", RECORD_SECONDS);
-		execl(exe, exe, "-s", seconds, "-o", path, (char *)NULL);
+		if (audio_enabled)
+			execl(exe, exe, "-s", seconds, "-o", path, "-a", "-r", resolution, (char *)NULL);
+		execl(exe, exe, "-s", seconds, "-o", path, "-r", resolution, (char *)NULL);
 		_exit(127);
 	}
 
@@ -552,6 +613,7 @@ static int capture_frame(void)
 	pid_t pid;
 
 	poll_children();
+	stop_preview();
 	if (g_frame_pid > 0) {
 		set_last_error("frame capture active");
 		return 409;
@@ -580,7 +642,8 @@ static int capture_frame(void)
 		return 500;
 	}
 	if (pid == 0) {
-		execl(exe, exe, "-o", path, (char *)NULL);
+		const char *resolution = g_mode_1440p ? "1440p" : "720p";
+		execl(exe, exe, "-o", path, "-r", resolution, (char *)NULL);
 		_exit(127);
 	}
 
@@ -1046,6 +1109,66 @@ static void http_reply(int fd, int code, const char *type, const char *body)
 		send_all(fd, body, len);
 }
 
+static void reply_preview_jpeg(int fd)
+{
+	char head[256];
+	char buf[16384];
+	struct stat st;
+	int image_fd;
+	pid_t pid;
+
+	g_preview_last_request = time(NULL);
+	if (g_rec_pid > 0 || g_frame_pid > 0 || g_rec_state == REC_STARTING ||
+	    g_rec_state == REC_RECORDING || g_rec_state == REC_STOPPING) {
+		http_reply(fd, 503, "text/plain", "camera is busy recording or capturing");
+		return;
+	}
+	if (start_preview() != 0) {
+		http_reply(fd, 503, "text/plain", "preview worker could not start");
+		return;
+	}
+	image_fd = open(PREVIEW_FILE, O_RDONLY | O_CLOEXEC);
+	if (image_fd < 0 || fstat(image_fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+		if (image_fd >= 0)
+			close(image_fd);
+		http_reply(fd, 503, "text/plain", "preview frame is starting");
+		return;
+	}
+	if (g_file_children >= MAX_FILE_CHILDREN) {
+		close(image_fd);
+		http_reply(fd, 503, "application/json", "{\"error\":\"too many file requests\"}");
+		return;
+	}
+	snprintf(head, sizeof(head),
+		"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: %lld\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+		(long long)st.st_size);
+	pid = fork();
+	if (pid == 0) {
+		size_t total = 0;
+		if (g_server_fd >= 0)
+			close(g_server_fd);
+		setpriority(PRIO_PROCESS, 0, 10);
+		set_socket_timeouts(fd);
+		send_all(fd, head, strlen(head));
+		while (total < (size_t)st.st_size) {
+			ssize_t n = read(image_fd, buf, sizeof(buf));
+			if (n <= 0)
+				break;
+			send_all(fd, buf, (size_t)n);
+			total += (size_t)n;
+		}
+		close(image_fd);
+		close(fd);
+		_exit(0);
+	}
+	close(image_fd);
+	if (pid < 0) {
+		http_reply(fd, 503, "text/plain", "could not start preview response");
+		return;
+	}
+	++g_file_children;
+}
+
 static void json_escape(char *dst, size_t size, const char *src)
 {
 	size_t pos = 0;
@@ -1081,11 +1204,12 @@ static void reply_status(int fd)
 	json_escape(file, sizeof(file), g_current_file);
 	json_escape(err, sizeof(err), g_last_error);
 	snprintf(body, sizeof(body),
-		"{\"state\":\"%s\",\"recording\":%s,\"current_file\":\"%s\","
+		"{\"state\":\"%s\",\"recording\":%s,\"resolution\":\"%s\",\"current_file\":\"%s\","
 		"\"duration_ms\":%ld,\"frame_capturing\":%s,\"free_bytes\":%llu,\"low_storage\":%s,"
 		"\"last_error\":\"%s\"}",
 		state_name(g_rec_state),
 		g_rec_state == REC_RECORDING ? "true" : "false",
+		g_mode_1440p ? "1440p" : "720p",
 		file, duration, g_frame_pid > 0 ? "true" : "false", (unsigned long long)free_bytes(),
 		low_storage() ? "true" : "false", err);
 	http_reply(fd, 200, "application/json", body);
@@ -1149,6 +1273,62 @@ static bool parse_json_long(const char *body, const char *key, long *value)
 	errno = 0;
 	*value = strtol(p, &end, 10);
 	return errno == 0 && end != p;
+}
+
+static bool parse_json_bool(const char *body, const char *key, bool *value)
+{
+	char quoted[64];
+	const char *p;
+	if (snprintf(quoted, sizeof(quoted), "\"%s\"", key) >= (int)sizeof(quoted))
+		return false;
+	p = strstr(body, quoted);
+	if (p == NULL || (p = strchr(p, ':')) == NULL)
+		return false;
+	++p;
+	while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+		++p;
+	if (strncmp(p, "true", 4) == 0) {
+		*value = true;
+		return true;
+	}
+	if (strncmp(p, "false", 5) == 0) {
+		*value = false;
+		return true;
+	}
+	return false;
+}
+
+static int set_resolution(const char *body)
+{
+	const char *p = strstr(body, "\"resolution\"");
+	bool mode_1440p;
+
+	if (p == NULL || (p = strchr(p, ':')) == NULL)
+		return 400;
+	++p;
+	while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+		++p;
+	if (*p++ != '"')
+		return 400;
+	if (strncmp(p, "720p\"", 5) == 0)
+		mode_1440p = false;
+	else if (strncmp(p, "1440p\"", 6) == 0)
+		mode_1440p = true;
+	else
+		return 400;
+
+	if (g_rec_pid > 0 || g_frame_pid > 0 ||
+	    (g_rec_state != REC_IDLE && g_rec_state != REC_ERROR))
+		return 409;
+	if (g_mode_1440p != mode_1440p) {
+		stop_preview();
+		/* Discard the prior resolution's last frame before accepting new requests. */
+		unlink(PREVIEW_FILE);
+		unlink(PREVIEW_FILE ".tmp");
+		g_mode_1440p = mode_1440p;
+		log_msg("capture resolution selected: %s", g_mode_1440p ? "1440p" : "720p");
+	}
+	return 200;
 }
 
 static bool parse_json_audio(const char *body)
@@ -1455,28 +1635,36 @@ static void send_file_in_child(int fd, const char *method, const char *filename,
 	++g_file_children;
 }
 
-static const char *index_html =
-"<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-"<title>Camera Recorder</title><style>"
-"body{font-family:sans-serif;margin:20px;line-height:1.4}button{margin:2px 6px 2px 0}table{border-collapse:collapse;width:100%;max-width:1100px}"
-"td,th{border-bottom:1px solid #ccc;padding:4px 6px;text-align:left}pre{background:#f5f5f5;padding:8px;overflow:auto}.small{color:#555}"
-"</style></head><body><h1>Camera Recorder</h1>"
-"<h2>Status</h2><pre id=s>loading...</pre>"
-"<p><button onclick=startRec()>Start Recording</button><button onclick=stopRec()>Stop Recording</button><button onclick=captureFrame()>Capture Frame</button></p>"
-"<h2>Recordings</h2><table><thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Modified</th><th>Actions</th></tr></thead><tbody id=r></tbody></table>"
-"<h2>Clip Task</h2><pre id=t>loading...</pre>"
-"<p class=small>Clip input uses seconds. Playback is via the file links.</p>"
-"<script>"
-"async function api(u,o){let r=await fetch(u,o);let tx=await r.text();try{return JSON.parse(tx)}catch(e){return tx}}"
-"function size(n){return(n/1048576).toFixed(1)+' MiB'}"
-"function ts(v){return v?new Date(v*1000).toLocaleString():''}"
-"async function refresh(){let s=await api('/api/status');document.getElementById('s').textContent=JSON.stringify(s,null,2);"
-"let rs=await api('/api/recordings');document.getElementById('r').innerHTML=rs.map(x=>`<tr><td><a target=\"_blank\" href=\"/recordings/${x.name}\">${x.name}</a></td><td>${x.type}</td><td>${size(x.size)}</td><td>${ts(x.mtime)}</td><td>${x.type=='video'?`<button onclick=\"clip('${x.name}')\">Clip</button>`:''}<button onclick=\"del('${x.name}')\">Delete</button></td></tr>`).join('');"
-"let t=await api('/api/clip/task');document.getElementById('t').textContent=JSON.stringify(t,null,2)}"
-"async function startRec(){await fetch('/api/record/start',{method:'POST'});refresh()}async function stopRec(){if(confirm('Stop recording?')){await fetch('/api/record/stop',{method:'POST'});refresh()}}async function captureFrame(){let r=await fetch('/api/frame/capture',{method:'POST'});if(!r.ok)alert(await r.text());refresh()}"
-"async function del(n){if(confirm('Delete '+n+'?')){let r=await fetch('/api/recordings/'+n,{method:'DELETE'});if(!r.ok)alert(await r.text());refresh()}}"
-"async function clip(n){let s=prompt('Start seconds','0');if(s==null)return;let e=prompt('End seconds','5');if(e==null)return;let a=confirm('Include audio? OK=yes Cancel=no');let r=await fetch('/api/recordings/'+n+'/clip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({start_ms:Math.round(+s*1000),end_ms:Math.round(+e*1000),audio:a})});if(!r.ok)alert(await r.text());refresh()}"
-"setInterval(refresh,1000);refresh();</script></body></html>";
+#define INDEX_HTML_PATH "/usr/share/wifi-camera/index.html"
+
+static void reply_index_html(int fd)
+{
+	char buf[8192];
+	char header[256];
+	struct stat st;
+	int file_fd = open(INDEX_HTML_PATH, O_RDONLY | O_CLOEXEC);
+	if (file_fd < 0 || fstat(file_fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+		if (file_fd >= 0)
+			close(file_fd);
+		http_reply(fd, 500, "text/plain", "camera interface is not installed");
+		return;
+	}
+	snprintf(header, sizeof(header),
+		"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %lld\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+		(long long)st.st_size);
+	if (send_all(fd, header, strlen(header)) != 0) {
+		close(file_fd);
+		return;
+	}
+	for (;;) {
+		ssize_t n = read(file_fd, buf, sizeof(buf));
+		if (n <= 0)
+			break;
+		if (send_all(fd, buf, (size_t)n) != 0)
+			break;
+	}
+	close(file_fd);
+}
 
 static void handle_client(int fd)
 {
@@ -1522,11 +1710,18 @@ static void handle_client(int fd)
 	}
 
 	if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
-		http_reply(fd, 200, "text/html; charset=utf-8", index_html);
+		reply_index_html(fd);
+	} else if (strcmp(method, "GET") == 0 && strncmp(path, "/api/preview.jpg", 16) == 0) {
+		reply_preview_jpeg(fd);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/status") == 0) {
 		reply_status(fd);
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/resolution") == 0) {
+		int rc = set_resolution(body);
+		http_reply(fd, rc, "application/json", rc == 200 ? "{\"ok\":true}" : "{\"ok\":false}");
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/record/start") == 0) {
-		int rc = start_recording();
+		bool audio_enabled = false;
+		parse_json_bool(body, "audio", &audio_enabled);
+		int rc = start_recording(audio_enabled);
 		http_reply(fd, rc, "application/json", rc == 200 ? "{\"ok\":true}" : "{\"ok\":false}");
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/record/stop") == 0) {
 		int rc = stop_recording();
@@ -1663,6 +1858,9 @@ int main(int argc, char **argv)
 		ready = select(server_fd + 1, &read_fds, NULL, NULL, &timeout);
 		poll_children();
 		check_low_space_stop();
+		if (g_preview_pid > 0 && g_preview_last_request > 0 &&
+		    time(NULL) - g_preview_last_request >= 3 && g_rec_state == REC_IDLE && g_frame_pid <= 0)
+			stop_preview();
 		if (ready < 0) {
 			if (errno == EINTR)
 				continue;
@@ -1688,6 +1886,7 @@ int main(int argc, char **argv)
 
 	if (g_rec_pid > 0)
 		stop_recording();
+	stop_preview();
 	set_record_led(false);
 	if (g_frame_pid > 0) {
 		char frame_path[PATH_MAX];
