@@ -43,6 +43,7 @@ static bool g_venc_receiving;
 static bool g_venc_fd_open;
 static CVI_S32 g_venc_fd = -1;
 static bool g_mode_1440p;
+static volatile sig_atomic_t g_stop;
 
 static void cleanup(void)
 {
