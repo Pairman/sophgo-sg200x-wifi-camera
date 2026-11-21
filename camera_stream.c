@@ -48,8 +48,8 @@
 #define OPT_SENSOR_TYPE GCORE_GC4653_MIPI_720P_60FPS_10BIT
 #define GC4653_VTS_H_ADDR 0x0340
 #define GC4653_VTS_L_ADDR 0x0341
-/* 720p sensor mode: 750 VTS at 60 fps, so 1800 VTS gives 25 fps. */
-#define GC4653_720P25_VTS 1800
+/* Board validation: the 720p mode starts at 1500 VTS/60 fps; 3600 gives 25 fps. */
+#define GC4653_720P25_VTS 3600
 
 extern int gc4653_write_register(VI_PIPE ViPipe, int addr, int data);
 extern int gc4653_read_register(VI_PIPE ViPipe, int addr);
@@ -120,24 +120,37 @@ static void cleanup(void)
 	}
 
 	if (g_venc_fd_open) {
-		CVI_VENC_CloseFd(VENC_CHN_ID);
+		CVI_S32 ret = CVI_VENC_CloseFd(VENC_CHN_ID);
+		if (ret != CVI_SUCCESS)
+			CVI_TRACE_LOG(CVI_DBG_ERR, "CVI_VENC_CloseFd failed: %#x\n", ret);
 		g_venc_fd_open = false;
 		g_venc_fd = -1;
 	}
 
 	if (g_venc_receiving) {
-		CVI_VENC_StopRecvFrame(VENC_CHN_ID);
+		CVI_S32 ret = CVI_VENC_StopRecvFrame(VENC_CHN_ID);
+		if (ret != CVI_SUCCESS)
+			CVI_TRACE_LOG(CVI_DBG_ERR, "CVI_VENC_StopRecvFrame failed: %#x\n", ret);
 		g_venc_receiving = false;
 	}
 
 	if (g_venc_ready) {
-		CVI_VENC_DestroyChn(VENC_CHN_ID);
+		CVI_S32 ret = CVI_VENC_ResetChn(VENC_CHN_ID);
+		if (ret != CVI_SUCCESS)
+			CVI_TRACE_LOG(CVI_DBG_ERR, "CVI_VENC_ResetChn failed: %#x\n", ret);
+		ret = CVI_VENC_DestroyChn(VENC_CHN_ID);
+		if (ret != CVI_SUCCESS)
+			CVI_TRACE_LOG(CVI_DBG_ERR, "CVI_VENC_DestroyChn failed: %#x\n", ret);
 		g_venc_ready = false;
 	}
 
 	if (g_vi_ready) {
-		SAMPLE_COMM_VI_DestroyIsp(&g_vi_config);
-		SAMPLE_COMM_VI_DestroyVi(&g_vi_config);
+		CVI_S32 ret = SAMPLE_COMM_VI_DestroyIsp(&g_vi_config);
+		if (ret != CVI_SUCCESS)
+			CVI_TRACE_LOG(CVI_DBG_ERR, "SAMPLE_COMM_VI_DestroyIsp failed: %#x\n", ret);
+		ret = SAMPLE_COMM_VI_DestroyVi(&g_vi_config);
+		if (ret != CVI_SUCCESS)
+			CVI_TRACE_LOG(CVI_DBG_ERR, "SAMPLE_COMM_VI_DestroyVi failed: %#x\n", ret);
 		g_vi_ready = false;
 	}
 
@@ -181,6 +194,7 @@ static CVI_S32 init_sys_and_vi(void)
 	PIC_SIZE_E pic_size;
 	SIZE_S sensor_size;
 	VB_CONFIG_S vb_config;
+	VI_CHN_ATTR_S chn_attr;
 	MMF_VERSION_S version;
 	LOG_LEVEL_CONF_S log_conf;
 	CVI_U32 blk_size;
@@ -214,7 +228,6 @@ static CVI_S32 init_sys_and_vi(void)
 	ret = SAMPLE_COMM_SYS_GetPicSize(pic_size, &sensor_size);
 	if (ret != CVI_SUCCESS)
 		return ret;
-
 	memset(&vb_config, 0, sizeof(vb_config));
 	vb_config.u32MaxPoolCnt = 1;
 	blk_size = COMMON_GetPicBufferSize(sensor_size.u32Width, sensor_size.u32Height,
@@ -235,6 +248,16 @@ static CVI_S32 init_sys_and_vi(void)
 		return ret;
 	g_vi_ready = true;
 	memcpy(&g_vi_config, &vi_config, sizeof(g_vi_config));
+
+	/* The channel may crop or scale the sensor mode; encode the actual VI size. */
+	memset(&chn_attr, 0, sizeof(chn_attr));
+	ret = CVI_VI_GetChnAttr(VI_DEV, VI_CHN, &chn_attr);
+	if (ret != CVI_SUCCESS)
+		return ret;
+	if (chn_attr.stSize.u32Width == 0 || chn_attr.stSize.u32Height == 0)
+		return CVI_FAILURE;
+	g_stream_width = chn_attr.stSize.u32Width;
+	g_stream_height = chn_attr.stSize.u32Height;
 
 	return CVI_SUCCESS;
 }
@@ -290,11 +313,12 @@ static CVI_S32 get_vi_frame(VIDEO_FRAME_INFO_S *frame)
 	return CVI_VI_GetChnFrame(VI_DEV, VI_CHN, frame, 3000);
 }
 
-static void release_vi_frame(VIDEO_FRAME_INFO_S *frame)
+static CVI_S32 release_vi_frame(VIDEO_FRAME_INFO_S *frame)
 {
 	CVI_S32 ret = CVI_VI_ReleaseChnFrame(VI_DEV, VI_CHN, frame);
 	if (ret != CVI_SUCCESS)
 		CVI_TRACE_LOG(CVI_DBG_ERR, "CVI_VI_ReleaseChnFrame failed: %#x\n", ret);
+	return ret;
 }
 
 static CVI_S32 wait_venc_stream(void)
@@ -323,12 +347,12 @@ static CVI_S32 wait_venc_stream(void)
 
 static int mov_file_read(void *param, void *data, uint64_t bytes)
 {
-	return fread(data, 1, bytes, param) == bytes ? 0 : ferror(param);
+	return fread(data, 1, bytes, param) == bytes ? 0 : -1;
 }
 
 static int mov_file_write(void *param, const void *data, uint64_t bytes)
 {
-	return fwrite(data, 1, bytes, param) == bytes ? 0 : ferror(param);
+	return fwrite(data, 1, bytes, param) == bytes ? 0 : -1;
 }
 
 static int mov_file_seek(void *param, int64_t offset)
@@ -495,7 +519,9 @@ static CVI_S32 drain_audio_until(CVI_U64 max_pts_ms, bool wait_for_pcm)
 	CVI_S32 encoded_bytes = 0;
 	CVI_S32 ret;
 
-	while ((g_audio_sample_index * 1000) / AUDIO_SAMPLE_RATE <= max_pts_ms) {
+	/* AAC frames are indivisible; only write frames that end within the target. */
+	while ((g_audio_sample_index + AUDIO_SAMPLES_PER_FRAME) * 1000 <=
+		(CVI_U64)max_pts_ms * AUDIO_SAMPLE_RATE) {
 		ret = get_audio_pcm_frame(pcm_samples, wait_for_pcm);
 		if (ret == 1)
 			break;
@@ -666,7 +692,11 @@ static CVI_S32 encode_one_frame(void)
 		return ret;
 
 	ret = CVI_VENC_SendFrame(VENC_CHN_ID, &frame, 1000);
-	release_vi_frame(&frame);
+	{
+		CVI_S32 release_ret = release_vi_frame(&frame);
+		if (ret == CVI_SUCCESS && release_ret != CVI_SUCCESS)
+			ret = release_ret;
+	}
 	if (ret != CVI_SUCCESS)
 		return ret;
 
@@ -719,14 +749,16 @@ static CVI_S32 capture_stream(const char *path, int seconds)
 
 	if (g_audio_enabled) {
 		ret = init_audio();
-		if (ret != CVI_SUCCESS)
-			return ret;
+		if (ret != CVI_SUCCESS) {
+			CVI_TRACE_LOG(CVI_DBG_ERR, "audio initialization failed; recording video only: %#x\n", ret);
+			g_audio_enabled = false;
+		}
 	}
 
 	usleep(800 * 1000);
 	ret = get_vi_frame(&warmup_frame);
 	if (ret == CVI_SUCCESS)
-		release_vi_frame(&warmup_frame);
+		ret = release_vi_frame(&warmup_frame);
 	if (ret != CVI_SUCCESS)
 		goto out;
 
@@ -735,24 +767,38 @@ static CVI_S32 capture_stream(const char *path, int seconds)
 		goto out;
 	if (g_audio_enabled) {
 		ret = start_audio_capture();
-		if (ret != CVI_SUCCESS)
-			goto out;
+		if (ret != CVI_SUCCESS) {
+			CVI_TRACE_LOG(CVI_DBG_ERR, "audio capture start failed; recording video only: %#x\n", ret);
+			g_audio_enabled = false;
+		}
 	}
 
 	for (int i = 0; i < frame_count && !g_stop; ++i) {
 		ret = encode_one_frame();
-		if (ret != CVI_SUCCESS)
+		if (ret != CVI_SUCCESS && !g_stop)
 			goto out;
+		if (g_stop) {
+			ret = CVI_SUCCESS;
+			break;
+		}
 
-		if (g_audio_enabled) {
+		if (g_audio_enabled && !g_stop) {
 			ret = drain_audio_until((CVI_U64)(i + 1) * STREAM_FRAME_MS, false);
-			if (ret != CVI_SUCCESS)
-				goto out;
+			if (ret != CVI_SUCCESS) {
+				CVI_TRACE_LOG(CVI_DBG_ERR, "audio encoding failed; continuing video only: %#x\n", ret);
+				g_audio_enabled = false;
+				ret = CVI_SUCCESS;
+			}
 		}
 	}
 
 	if (g_audio_enabled && !g_stop)
 		ret = drain_audio_until((CVI_U64)seconds * 1000, true);
+	if (ret != CVI_SUCCESS && g_audio_enabled) {
+		CVI_TRACE_LOG(CVI_DBG_ERR, "audio finalization failed; video remains available: %#x\n", ret);
+		g_audio_enabled = false;
+		ret = CVI_SUCCESS;
+	}
 
 out:
 	return ret;

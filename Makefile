@@ -12,6 +12,7 @@ CC := $(CROSS_COMPILE)gcc
 CXX := $(CROSS_COMPILE)g++
 STRIP ?= $(CROSS_COMPILE)strip
 PKG_CONFIG ?= pkg-config
+SYSROOT_FLAG := $(if $(SYSROOT),--sysroot=$(SYSROOT),)
 
 chip_lc := $(shell echo $(CHIP_ARCH) | tr A-Z a-z)
 MW_INC := $(MIDDLEWARE_DIR)/include
@@ -20,12 +21,13 @@ MW_3RD_LIB := $(MIDDLEWARE_DIR)/lib/3rd
 KERNEL_INC ?= $(KERNEL_DIR)/riscv/usr/include
 MEDIA_SERVER_DIR := $(MIDDLEWARE_DIR)/sample/test_mmf/media_server-1.0.x
 
+# The camera programs select GC4653 after parsing the VI configuration.
+# Do not inject stale compile-time IMX327 sensor defaults here.
 COMMON_CFLAGS := \
 	-O2 -g -std=gnu11 -Wall -Wextra -ffunction-sections -fdata-sections \
+	$(SYSROOT_FLAG) \
 	-mcpu=c906fdv -march=rv64imafdcv0p7xthead -mcmodel=medany -mabi=lp64d \
 	-DARCH_$(CHIP_ARCH) -D__CV181X__ -D__SOC_MARS__ \
-	-DSENSOR0_TYPE=SONY_IMX327_MIPI_2M_30FPS_12BIT \
-	-DSENSOR1_TYPE=SONY_IMX327_MIPI_2M_30FPS_12BIT \
 	-I$(MW_INC) \
 	-I$(MIDDLEWARE_DIR)/modules/isp/include/$(chip_lc) \
 	-I$(MW_INC)/isp/$(chip_lc) \
@@ -40,7 +42,7 @@ COMMON_CFLAGS := \
 
 DEPFLAGS := -MMD
 CFLAGS += $(COMMON_CFLAGS)
-LDFLAGS += -Wl,--gc-sections -Wl,--as-needed -L$(MW_LIB) -L$(MW_3RD_LIB) \
+LDFLAGS += $(SYSROOT_FLAG) -Wl,--gc-sections -Wl,--as-needed -L$(MW_LIB) -L$(MW_3RD_LIB) \
 	-Wl,-rpath=/mnt/system/usr/lib -Wl,-rpath=/mnt/system/usr/lib/3rd
 
 PKG_CONFIG_PATH := $(MIDDLEWARE_DIR)/pkgconfig

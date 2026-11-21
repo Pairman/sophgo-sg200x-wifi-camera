@@ -17,13 +17,44 @@
 <div class="group"><h3>Device</h3><pre id="status" class="muted">Loading…</pre></div></section>
 <section class="tab-pane" id="recordings"><h3>Saved recordings</h3><ul id="files"></ul></section></aside></main>
 <script>
-const $=id=>document.getElementById(id);let busy=false,previewGeneration=0;
+const $=id=>document.getElementById(id);
+let busy=false,previewGeneration=0,previewRetryAt=0,previewBackoff=1000;
+let previewInFlight=false,previewImage=null,previewTimer=null;
+let refreshInFlight=false,refreshQueued=false;
 async function api(url,options){const r=await fetch(url,options);const t=await r.text();let v;try{v=JSON.parse(t)}catch{v=t}if(!r.ok)throw Error(typeof v==='string'?v:(v.error||r.statusText));return v}
-function drawPreview(){if(document.hidden||busy)return;const generation=previewGeneration;const u='/api/preview.jpg?t='+Date.now();const im=new Image();im.onload=()=>{if(generation!==previewGeneration)return;const c=$('streamCanvas'),ctx=c.getContext('2d');c.width=im.naturalWidth;c.height=im.naturalHeight;ctx.drawImage(im,0,0);$('loading').hidden=true;$('downloadFrame').href=u};im.onerror=()=>{if(generation!==previewGeneration)return;$('loading').hidden=false;$('loading').textContent='Preview unavailable or starting…'};im.src=u}
-async function refresh(){try{const s=await api('/api/status');const wasBusy=busy;busy=!!(s.recording||s.frame_capturing);if(busy&&!wasBusy)previewGeneration++;$('status').textContent=JSON.stringify(s,null,2);$('state').textContent=s.recording?'Recording':s.frame_capturing?'Taking photo':'Ready';$('state').className=s.recording?'recording':'';$('record').textContent=s.recording?'■ Stop recording':'● Start recording';$('resolution').value=s.resolution;$('resolution').disabled=busy;$('record').disabled=!!s.frame_capturing;$('capture').disabled=busy;$('resolutionLabel').textContent=s.resolution+' · 1 fps preview';if(busy){$('streamCanvas').width=0;$('streamCanvas').height=0;$('loading').hidden=false;$('loading').textContent='Camera is recording or capturing'}const items=await api('/api/recordings');$('files').replaceChildren(...items.map(x=>{const li=document.createElement('li');const a=document.createElement('a');a.href='/recordings/'+encodeURIComponent(x.name);a.textContent=x.name;a.download=x.name;li.append(a,document.createTextNode(' · '+x.type+' · '+(x.size/1048576).toFixed(1)+' MiB'));const actions=document.createElement('div');actions.className='file-actions';const del=document.createElement('button');del.className='secondary';del.textContent='Delete';del.onclick=()=>deleteRecording(x.name);actions.append(del);li.append(actions);return li}))}catch(e){$('state').textContent='Offline'}}
+function resetPreviewBackoff(){previewRetryAt=0;previewBackoff=1000}
+function cancelPreviewRequest(){previewGeneration++;if(previewTimer!==null){clearTimeout(previewTimer);previewTimer=null}if(previewImage!==null){previewImage.onload=null;previewImage.onerror=null;previewImage.src='';previewImage=null}previewInFlight=false}
+function drawPreview(){
+  if(document.hidden||busy||previewInFlight||Date.now()<previewRetryAt)return;
+  const generation=previewGeneration,u='/api/preview.jpg?t='+Date.now(),im=new Image();
+  previewInFlight=true;previewImage=im;
+  const finish=()=>{if(previewImage===im){previewImage=null;previewInFlight=false;if(previewTimer!==null){clearTimeout(previewTimer);previewTimer=null}}};
+  im.onload=()=>{finish();if(generation!==previewGeneration||document.hidden)return;previewBackoff=1000;previewRetryAt=0;const c=$('streamCanvas'),ctx=c.getContext('2d');c.width=im.naturalWidth;c.height=im.naturalHeight;ctx.drawImage(im,0,0);$('loading').hidden=true;$('downloadFrame').href=u};
+  im.onerror=()=>{finish();if(generation!==previewGeneration)return;$('loading').hidden=false;$('loading').textContent='Preview unavailable or starting…';previewRetryAt=Date.now()+previewBackoff;previewBackoff=Math.min(previewBackoff*2,10000)};
+  previewTimer=setTimeout(()=>{if(previewImage!==im)return;cancelPreviewRequest();$('loading').hidden=false;$('loading').textContent='Preview request timed out…';previewRetryAt=Date.now()+previewBackoff;previewBackoff=Math.min(previewBackoff*2,10000)},8000);
+  im.src=u;
+}
+async function refresh(){
+  if(refreshInFlight){refreshQueued=true;return}
+  refreshInFlight=true;
+  try{
+    const s=await api('/api/status');
+    const wasBusy=busy;
+    busy=!!(s.frame_capturing||s.state==='starting'||s.state==='recording'||s.state==='stopping');
+    if(busy&&!wasBusy)cancelPreviewRequest();
+    $('status').textContent=JSON.stringify(s,null,2);
+    $('state').textContent=s.state==='recording'?'Recording':s.state==='starting'?'Starting…':s.state==='stopping'?'Stopping…':s.frame_capturing?'Taking photo':s.state==='error'?'Error':'Ready';
+    $('state').className=s.recording?'recording':'';
+    $('record').textContent=s.recording?'■ Stop recording':'● Start recording';
+    $('resolution').value=s.resolution;$('resolution').disabled=busy;$('record').disabled=!!s.frame_capturing||s.state==='starting'||s.state==='stopping';$('capture').disabled=busy;$('resolutionLabel').textContent=s.resolution+' · 1 fps preview';
+    if(busy){$('streamCanvas').width=0;$('streamCanvas').height=0;$('loading').hidden=false;$('loading').textContent='Camera is recording or capturing'}
+    const items=await api('/api/recordings');
+    $('files').replaceChildren(...items.map(x=>{const li=document.createElement('li');const a=document.createElement('a');a.href='/recordings/'+encodeURIComponent(x.name);a.textContent=x.name;a.download=x.name;li.append(a,document.createTextNode(' · '+x.type+' · '+(x.size/1048576).toFixed(1)+' MiB'));const actions=document.createElement('div');actions.className='file-actions';const del=document.createElement('button');del.className='secondary';del.textContent='Delete';del.onclick=()=>deleteRecording(x.name);actions.append(del);li.append(actions);return li}));
+  }catch(e){$('state').textContent='Offline'}finally{refreshInFlight=false;if(refreshQueued){refreshQueued=false;refresh()}}
+}
 async function deleteRecording(name){if(!confirm('Delete '+name+'?'))return;try{await api('/api/recordings/'+encodeURIComponent(name),{method:'DELETE'});refresh()}catch(e){alert(e.message)}}
-$('resolution').onchange=async e=>{previewGeneration++;try{await api('/api/resolution',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resolution:e.target.value})});$('streamCanvas').width=0;$('streamCanvas').height=0;$('loading').hidden=false;$('loading').textContent='Starting '+e.target.value+' preview…';drawPreview();refresh()}catch(err){alert(err.message);refresh()}};
+$('resolution').onchange=async e=>{cancelPreviewRequest();resetPreviewBackoff();try{await api('/api/resolution',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resolution:e.target.value})});$('streamCanvas').width=0;$('streamCanvas').height=0;$('loading').hidden=false;$('loading').textContent='Starting '+e.target.value+' preview…';drawPreview();refresh()}catch(err){alert(err.message);refresh()}};
 $('record').onclick=async()=>{try{const s=await api('/api/status');if(s.recording)await api('/api/record/stop',{method:'POST'});else await api('/api/record/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({audio:$('audio').checked})});refresh()}catch(e){alert(e.message)}};
 $('capture').onclick=async()=>{try{await api('/api/frame/capture',{method:'POST'});refresh()}catch(e){alert(e.message)}};
-document.querySelectorAll('.tab-btn').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab-btn,.tab-pane').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.tab).classList.add('active')});document.addEventListener('visibilitychange',()=>{if(!document.hidden)drawPreview()});drawPreview();setInterval(drawPreview,1000);refresh();setInterval(refresh,2000);
+document.querySelectorAll('.tab-btn').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab-btn,.tab-pane').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.tab).classList.add('active')});document.addEventListener('visibilitychange',()=>{if(document.hidden)cancelPreviewRequest();else{resetPreviewBackoff();drawPreview()}});drawPreview();setInterval(drawPreview,1000);refresh();setInterval(refresh,2000);
 </script></body></html>

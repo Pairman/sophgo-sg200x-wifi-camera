@@ -43,12 +43,12 @@ typedef struct {
 
 static int file_read(void *param, void *data, uint64_t bytes)
 {
-	return fread(data, 1, bytes, param) == bytes ? 0 : ferror(param);
+	return fread(data, 1, bytes, param) == bytes ? 0 : -1;
 }
 
 static int file_write(void *param, const void *data, uint64_t bytes)
 {
-	return fwrite(data, 1, bytes, param) == bytes ? 0 : ferror(param);
+	return fwrite(data, 1, bytes, param) == bytes ? 0 : -1;
 }
 
 static int file_seek(void *param, int64_t offset)

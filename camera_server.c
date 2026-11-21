@@ -21,6 +21,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <strings.h>
 
 #define DEFAULT_SERVER_PORT 8001
 #define APP_DIR "/var/lib/wifi-camera"
@@ -39,6 +40,8 @@
 #define MAX_FILE_CHILDREN 8
 #define FILE_RANGE_CHUNK_BYTES (2 * 1024 * 1024)
 #define RECORD_SECONDS 31536000
+#define LOG_MAX_BYTES (1024 * 1024)
+#define LOG_ROTATIONS 3
 
 typedef enum {
 	REC_IDLE = 0,
@@ -72,6 +75,8 @@ static time_t g_started_at;
 static time_t g_stop_requested_at;
 static char g_last_error[256];
 static FILE *g_log;
+static char g_log_path[PATH_MAX];
+static bool g_log_info_enabled;
 
 static pid_t g_frame_pid = -1;
 static char g_frame_file[NAME_MAX + 1];
@@ -87,8 +92,28 @@ static char g_clip_error[256];
 static time_t g_clip_started_at;
 static time_t g_clip_finished_at;
 static int g_file_children;
+static pid_t g_file_child_pids[MAX_FILE_CHILDREN];
 
 static pid_t find_camera_stream_process(void);
+
+static void track_file_child(pid_t pid)
+{
+	if (g_file_children < MAX_FILE_CHILDREN)
+		g_file_child_pids[g_file_children++] = pid;
+}
+
+static bool untrack_file_child(pid_t pid)
+{
+	for (int i = 0; i < g_file_children; ++i) {
+		if (g_file_child_pids[i] == pid) {
+			g_file_child_pids[i] = g_file_child_pids[g_file_children - 1];
+			g_file_child_pids[g_file_children - 1] = -1;
+			--g_file_children;
+			return true;
+		}
+	}
+	return false;
+}
 
 static bool name_is_camera_server(const char *name)
 {
@@ -105,13 +130,39 @@ static void set_last_error(const char *msg)
 	snprintf(g_last_error, sizeof(g_last_error), "%s", msg != NULL ? msg : "");
 }
 
-static void log_msg(const char *fmt, ...)
+static void rotate_log_if_needed(void)
 {
-	va_list ap;
+	long position;
+	char rotated[PATH_MAX];
+	char older[PATH_MAX];
+
+	if (g_log == NULL)
+		return;
+	position = ftell(g_log);
+	if (position < 0 || position < LOG_MAX_BYTES)
+		return;
+
+	fclose(g_log);
+	g_log = NULL;
+	for (int i = LOG_ROTATIONS - 1; i >= 1; --i) {
+		snprintf(older, sizeof(older), "%s.%d", g_log_path, i);
+		snprintf(rotated, sizeof(rotated), "%s.%d", g_log_path, i + 1);
+		rename(older, rotated);
+	}
+	snprintf(rotated, sizeof(rotated), "%s.1", g_log_path);
+	rename(g_log_path, rotated);
+	g_log = fopen(g_log_path, "a");
+}
+
+static void log_write(const char *fmt, va_list ap)
+{
 	time_t now;
 	struct tm tmv;
 	char ts[32];
 
+	if (g_log == NULL)
+		return;
+	rotate_log_if_needed();
 	if (g_log == NULL)
 		return;
 
@@ -120,12 +171,28 @@ static void log_msg(const char *fmt, ...)
 	strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
 	fprintf(g_log, "[%s] ", ts);
 
-	va_start(ap, fmt);
 	vfprintf(g_log, fmt, ap);
-	va_end(ap);
-
 	fputc('\n', g_log);
 	fflush(g_log);
+}
+
+/* Error messages are recorded by default; informational tracing is opt-in. */
+static void log_msg(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	log_write(fmt, ap);
+	va_end(ap);
+}
+
+static void log_info(const char *fmt, ...)
+{
+	va_list ap;
+	if (!g_log_info_enabled)
+		return;
+	va_start(ap, fmt);
+	log_write(fmt, ap);
+	va_end(ap);
 }
 
 static int write_text_file(const char *path, const char *text)
@@ -243,11 +310,16 @@ static int init_log(void)
 	g_log = fopen(name, "a");
 	if (g_log == NULL)
 		return -1;
+	snprintf(g_log_path, sizeof(g_log_path), "%s", name);
+	g_log_info_enabled = false;
+	if (getenv("WIFI_CAMERA_LOG_LEVEL") != NULL &&
+		strcmp(getenv("WIFI_CAMERA_LOG_LEVEL"), "info") == 0)
+		g_log_info_enabled = true;
 
 	snprintf(link_path, sizeof(link_path), "%s/latest.log", LOG_DIR);
 	unlink(link_path);
 	symlink(rel, link_path);
-	log_msg("server start");
+	log_info("server start");
 	return 0;
 }
 
@@ -289,13 +361,15 @@ static bool low_storage(void)
 
 static void make_datetime_name(char *buf, size_t size, const char *prefix, const char *suffix)
 {
-	time_t now = time(NULL);
+	struct timespec now;
 	struct tm tmv;
 	char ts[32];
 
-	localtime_r(&now, &tmv);
+	if (clock_gettime(CLOCK_REALTIME, &now) != 0)
+		now.tv_sec = time(NULL), now.tv_nsec = 0;
+	localtime_r(&now.tv_sec, &tmv);
 	strftime(ts, sizeof(ts), "%Y-%m-%d_%H-%M-%S", &tmv);
-	snprintf(buf, size, "%s%s%s", prefix, ts, suffix);
+	snprintf(buf, size, "%s%s-%09ld%s", prefix, ts, now.tv_nsec, suffix);
 }
 
 static void find_executable(char *out, size_t size, const char *system_path,
@@ -310,23 +384,37 @@ static void find_executable(char *out, size_t size, const char *system_path,
 	}
 }
 
-static void stop_preview(void)
+static void terminate_child(pid_t *pid_ptr, const char *name, int timeout_ms)
 {
 	int status;
-	if (g_preview_pid <= 0)
+	pid_t pid = *pid_ptr;
+	if (pid <= 0)
 		return;
-	kill(g_preview_pid, SIGTERM);
-	for (int i = 0; i < 30; ++i) {
-		pid_t rc = waitpid(g_preview_pid, &status, WNOHANG);
-		if (rc == g_preview_pid || (rc < 0 && errno == ECHILD)) {
-			g_preview_pid = -1;
+	if (kill(pid, SIGTERM) != 0 && errno != ESRCH)
+		log_msg("%s SIGTERM failed: %s", name, strerror(errno));
+	for (int waited = 0; waited <= timeout_ms; waited += 50) {
+		pid_t rc = waitpid(pid, &status, WNOHANG);
+		if (rc == pid || (rc < 0 && errno == ECHILD)) {
+			*pid_ptr = -1;
 			return;
 		}
+		if (rc < 0 && errno != EINTR)
+			break;
 		usleep(50 * 1000);
 	}
-	kill(g_preview_pid, SIGKILL);
-	waitpid(g_preview_pid, &status, 0);
-	g_preview_pid = -1;
+	log_msg("%s did not exit after SIGTERM; sending SIGKILL", name);
+	if (kill(pid, SIGKILL) != 0 && errno != ESRCH)
+		log_msg("%s SIGKILL failed: %s", name, strerror(errno));
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+		;
+	*pid_ptr = -1;
+}
+
+static void stop_preview(void)
+{
+	if (g_preview_pid <= 0)
+		return;
+	terminate_child(&g_preview_pid, "preview process", 5000);
 }
 
 static int start_preview(void)
@@ -352,7 +440,7 @@ static int start_preview(void)
 		execl(exe, exe, "-p", PREVIEW_FILE, "-r", resolution, (char *)NULL);
 		_exit(127);
 	}
-	log_msg("on-demand preview process started: pid=%ld", (long)g_preview_pid);
+	log_info("on-demand preview process started: pid=%ld", (long)g_preview_pid);
 	return 0;
 }
 
@@ -412,7 +500,7 @@ static void update_recording_start_state(void)
 	if (current_recording_file_exists()) {
 		set_rec_state(REC_RECORDING);
 		set_last_error("");
-		log_msg("record file opened: %s", g_current_file);
+		log_info("record file opened: %s", g_current_file);
 		return;
 	}
 
@@ -432,8 +520,8 @@ static void poll_children(void)
 
 	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
 		if (pid == g_rec_pid) {
-			if (g_rec_state == REC_STOPPING || (WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
-				log_msg("record stop success: %s", g_current_file);
+			if (WIFEXITED(status) && WEXITSTATUS(status) == 0 && g_rec_state != REC_ERROR) {
+				log_info("record stop success: %s", g_current_file);
 				set_rec_state(REC_IDLE);
 				set_last_error("");
 			} else {
@@ -447,7 +535,7 @@ static void poll_children(void)
 			if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
 				g_clip_state = CLIP_DONE;
 				g_clip_error[0] = '\0';
-				log_msg("clip success: %s -> %s", g_clip_input, g_clip_output);
+				log_info("clip success: %s -> %s", g_clip_input, g_clip_output);
 			} else {
 				g_clip_state = CLIP_FAILED;
 				snprintf(g_clip_error, sizeof(g_clip_error), "camera_clip failed: status=%d", status);
@@ -456,7 +544,7 @@ static void poll_children(void)
 			g_clip_pid = -1;
 		} else if (pid == g_frame_pid) {
 			if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-				log_msg("frame capture success: %s", g_frame_file);
+				log_info("frame capture success: %s", g_frame_file);
 				set_last_error("");
 			} else {
 				char failed_path[PATH_MAX];
@@ -467,18 +555,13 @@ static void poll_children(void)
 			}
 			g_frame_pid = -1;
 		} else if (pid == g_preview_pid) {
-			log_msg("preview process stopped: pid=%ld status=%d", (long)pid, status);
+			log_info("preview process stopped: pid=%ld status=%d", (long)pid, status);
 			g_preview_pid = -1;
 			if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 				g_preview_retry_after = time(NULL) + 5;
-		} else if (g_file_children > 0) {
-			--g_file_children;
+		} else {
+			untrack_file_child(pid);
 		}
-	}
-
-	if (g_rec_state == REC_STOPPING && g_rec_pid <= 0) {
-		set_rec_state(REC_IDLE);
-		set_last_error("");
 	}
 
 	update_recording_start_state();
@@ -486,8 +569,8 @@ static void poll_children(void)
 
 static void finish_recording_child(int status)
 {
-	if (g_rec_state == REC_STOPPING || (WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
-		log_msg("record stop success: %s", g_current_file);
+	if (WIFEXITED(status) && WEXITSTATUS(status) == 0 && g_rec_state != REC_ERROR) {
+		log_info("record stop success: %s", g_current_file);
 		set_rec_state(REC_IDLE);
 		set_last_error("");
 	} else {
@@ -513,9 +596,9 @@ static int wait_recording_stopped(pid_t pid, int timeout_ms)
 		if (rc < 0) {
 			if (errno == ECHILD) {
 				g_rec_pid = -1;
-				set_rec_state(REC_IDLE);
-				set_last_error("");
-				return 0;
+				set_rec_state(REC_ERROR);
+				set_last_error("recorder status unavailable");
+				return -1;
 			}
 			return -1;
 		}
@@ -572,7 +655,7 @@ static int start_recording(bool audio_enabled)
 	g_started_at = time(NULL);
 	g_stop_requested_at = 0;
 	set_rec_state(REC_STARTING);
-	log_msg("record start requested: %s", name);
+	log_info("record start requested: %s", name);
 
 	pid = fork();
 	if (pid < 0) {
@@ -593,7 +676,7 @@ static int start_recording(bool audio_enabled)
 
 	g_rec_pid = pid;
 	set_last_error("recorder starting");
-	log_msg("record process started: pid=%ld file=%s", (long)pid, name);
+	log_info("record process started: pid=%ld file=%s", (long)pid, name);
 	for (int i = 0; i < 20; ++i) {
 		usleep(100 * 1000);
 		poll_children();
@@ -650,7 +733,7 @@ static int capture_frame(void)
 	g_frame_pid = pid;
 	snprintf(g_frame_file, sizeof(g_frame_file), "%s", name);
 	set_last_error("");
-	log_msg("frame capture start: pid=%ld file=%s", (long)pid, name);
+	log_info("frame capture start: pid=%ld file=%s", (long)pid, name);
 	return 200;
 }
 
@@ -667,7 +750,7 @@ static int stop_recording(void)
 			return 200;
 		}
 		pid = g_rec_pid;
-		log_msg("record stop wait requested: pid=%ld file=%s", (long)pid, g_current_file);
+		log_info("record stop wait requested: pid=%ld file=%s", (long)pid, g_current_file);
 		rc = wait_recording_stopped(pid, 3000);
 		if (rc < 0) {
 			set_rec_state(REC_ERROR);
@@ -690,13 +773,20 @@ static int stop_recording(void)
 	pid = g_rec_pid;
 	g_stop_requested_at = time(NULL);
 	set_rec_state(REC_STOPPING);
-	log_msg("record stop requested: pid=%ld file=%s", (long)pid, g_current_file);
+	log_info("record stop requested: pid=%ld file=%s", (long)pid, g_current_file);
 	if (kill(pid, SIGTERM) != 0) {
 		if (errno == ESRCH) {
-			g_rec_pid = -1;
-			set_rec_state(REC_IDLE);
-			set_last_error("");
-			log_msg("record stop: recorder already exited");
+			/* A zombie also makes kill(2) report ESRCH; reap it and inspect status. */
+			rc = wait_recording_stopped(pid, 0);
+			if (rc < 0) {
+				set_rec_state(REC_ERROR);
+				set_last_error("failed to collect recorder status");
+				return 500;
+			}
+			if (rc > 0) {
+				set_rec_state(REC_STOPPING);
+				set_last_error("recorder is stopping");
+			}
 			return 200;
 		}
 		set_rec_state(REC_ERROR);
@@ -862,9 +952,9 @@ static void check_orphan_recorder_on_startup(void)
 	if (pid <= 0)
 		return;
 
-	log_msg("found existing camera_stream pid=%ld; requesting graceful stop", (long)pid);
+	log_info("found existing camera_stream pid=%ld; requesting graceful stop", (long)pid);
 	if (kill(pid, SIGTERM) == 0 && wait_process_gone(pid, 5000)) {
-		log_msg("existing camera_stream stopped");
+		log_info("existing camera_stream stopped");
 		return;
 	}
 
@@ -977,7 +1067,7 @@ static int kill_old_camera_processes_on_port(int port)
 		if (!proc_has_socket_inode(pid, listen_inode))
 			continue;
 
-		log_msg("killing old camera process pid=%ld on port %d", (long)pid, port);
+		log_info("killing old camera process pid=%ld on port %d", (long)pid, port);
 		if (kill(pid, SIGTERM) == 0)
 			++killed;
 	}
@@ -996,7 +1086,7 @@ static int bind_server_socket(int server_fd, struct sockaddr_in *addr)
 			return -1;
 
 		fprintf(stderr, "port %d is in use; trying to stop old camera process\n", g_server_port);
-		log_msg("port %d is in use; trying to stop old camera process", g_server_port);
+		log_info("port %d is in use; trying to stop old camera process", g_server_port);
 		if (kill_old_camera_processes_on_port(g_server_port) <= 0) {
 			errno = EADDRINUSE;
 			return -1;
@@ -1057,15 +1147,18 @@ static int list_recordings(recording_t *items, int max_items)
 	return count;
 }
 
-static void send_all(int fd, const char *buf, size_t len)
+static int send_all(int fd, const char *buf, size_t len)
 {
 	while (len > 0) {
 		ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
+		if (n < 0 && errno == EINTR)
+			continue;
 		if (n <= 0)
-			return;
+			return -1;
 		buf += n;
 		len -= (size_t)n;
 	}
+	return 0;
 }
 
 static void set_socket_timeouts(int fd)
@@ -1104,9 +1197,10 @@ static void http_reply(int fd, int code, const char *type, const char *body)
 	snprintf(head, sizeof(head),
 		"HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
 		code, status, type, len);
-	send_all(fd, head, strlen(head));
+	if (send_all(fd, head, strlen(head)) != 0)
+		return;
 	if (len > 0)
-		send_all(fd, body, len);
+		(void)send_all(fd, body, len);
 }
 
 static void reply_preview_jpeg(int fd)
@@ -1149,12 +1243,17 @@ static void reply_preview_jpeg(int fd)
 			close(g_server_fd);
 		setpriority(PRIO_PROCESS, 0, 10);
 		set_socket_timeouts(fd);
-		send_all(fd, head, strlen(head));
+		if (send_all(fd, head, strlen(head)) != 0) {
+			close(image_fd);
+			close(fd);
+			_exit(0);
+		}
 		while (total < (size_t)st.st_size) {
 			ssize_t n = read(image_fd, buf, sizeof(buf));
 			if (n <= 0)
 				break;
-			send_all(fd, buf, (size_t)n);
+			if (send_all(fd, buf, (size_t)n) != 0)
+				break;
 			total += (size_t)n;
 		}
 		close(image_fd);
@@ -1166,7 +1265,7 @@ static void reply_preview_jpeg(int fd)
 		http_reply(fd, 503, "text/plain", "could not start preview response");
 		return;
 	}
-	++g_file_children;
+	track_file_child(pid);
 }
 
 static void json_escape(char *dst, size_t size, const char *src)
@@ -1218,25 +1317,67 @@ static void reply_status(int fd)
 static void reply_recordings(int fd)
 {
 	recording_t items[MAX_FILES];
-	char body[32768];
-	char *p = body;
-	size_t left = sizeof(body);
+	char **escaped;
+	size_t body_size = 3;
+	char *body;
+	char *p;
 	int count = list_recordings(items, MAX_FILES);
-
-	p += snprintf(p, left, "[");
-	left = sizeof(body) - (size_t)(p - body);
-	for (int i = 0; i < count && left > 128; ++i) {
-		char name[NAME_MAX * 2];
-		json_escape(name, sizeof(name), items[i].name);
-		p += snprintf(p, left, "%s{\"name\":\"%s\",\"type\":\"%s\",\"size\":%llu,\"mtime\":%lld}",
-			i == 0 ? "" : ",", name,
+	escaped = calloc((size_t)count, sizeof(*escaped));
+	if (escaped == NULL && count > 0) {
+		http_reply(fd, 500, "application/json", "{\"error\":\"out of memory\"}");
+		return;
+	}
+	for (int i = 0; i < count; ++i) {
+		int n;
+		escaped[i] = malloc(NAME_MAX * 2);
+		if (escaped[i] == NULL)
+			goto out_of_memory;
+		json_escape(escaped[i], NAME_MAX * 2, items[i].name);
+		n = snprintf(NULL, 0, "%s{\"name\":\"%s\",\"type\":\"%s\",\"size\":%llu,\"mtime\":%lld}",
+			i == 0 ? "" : ",", escaped[i],
 			has_suffix(items[i].name, ".mp4") ? "video" : "photo",
 			(unsigned long long)items[i].size,
 			(long long)items[i].mtime);
-		left = sizeof(body) - (size_t)(p - body);
+		if (n < 0 || body_size > SIZE_MAX - (size_t)n)
+			goto out_of_memory;
+		body_size += (size_t)n;
 	}
-	snprintf(p, left, "]");
+	body = malloc(body_size);
+	if (body == NULL)
+		goto out_of_memory;
+	p = body;
+	*p++ = '[';
+	for (int i = 0; i < count; ++i) {
+		int n = snprintf(p, body_size - (size_t)(p - body),
+			"%s{\"name\":\"%s\",\"type\":\"%s\",\"size\":%llu,\"mtime\":%lld}",
+			i == 0 ? "" : ",", escaped[i],
+			has_suffix(items[i].name, ".mp4") ? "video" : "photo",
+			(unsigned long long)items[i].size,
+			(long long)items[i].mtime);
+		if (n < 0 || (size_t)n >= body_size - (size_t)(p - body)) {
+			free(body);
+			for (int j = 0; j < count; ++j)
+				free(escaped[j]);
+			free(escaped);
+			http_reply(fd, 500, "application/json", "{\"error\":\"recordings response overflow\"}");
+			return;
+		}
+		p += n;
+	}
+	*p++ = ']';
+	*p = '\0';
 	http_reply(fd, 200, "application/json", body);
+	free(body);
+	for (int i = 0; i < count; ++i)
+		free(escaped[i]);
+	free(escaped);
+	return;
+
+out_of_memory:
+	for (int i = 0; i < count; ++i)
+		free(escaped[i]);
+	free(escaped);
+	http_reply(fd, 500, "application/json", "{\"error\":\"out of memory\"}");
 }
 
 static void reply_clip_task(int fd)
@@ -1326,7 +1467,7 @@ static int set_resolution(const char *body)
 		unlink(PREVIEW_FILE);
 		unlink(PREVIEW_FILE ".tmp");
 		g_mode_1440p = mode_1440p;
-		log_msg("capture resolution selected: %s", g_mode_1440p ? "1440p" : "720p");
+		log_info("capture resolution selected: %s", g_mode_1440p ? "1440p" : "720p");
 	}
 	return 200;
 }
@@ -1386,6 +1527,35 @@ static void make_clip_output(char *out, size_t size, const char *input, long sta
 		audio ? "" : "_noaudio");
 }
 
+static int make_unique_clip_output(char *out, size_t size, const char *input,
+	long start_ms, long end_ms, bool audio)
+{
+	char path[PATH_MAX];
+	char base[NAME_MAX + 1];
+	char *dot;
+
+	make_clip_output(out, size, input, start_ms, end_ms, audio);
+	for (unsigned int suffix = 0; ; ++suffix) {
+		int exists;
+		snprintf(path, sizeof(path), "%s/%s", RECORDINGS_DIR, out);
+		exists = access(path, F_OK);
+		if (exists != 0) {
+			if (errno == ENOENT)
+				return 0;
+			return -1;
+		}
+		if (suffix == 0) {
+			snprintf(base, sizeof(base), "%s", out);
+			dot = strrchr(base, '.');
+			if (dot == NULL)
+				return -1;
+			*dot = '\0';
+		}
+		if (snprintf(out, size, "%s_%u.mp4", base, suffix + 1) >= (int)size)
+			return -1;
+	}
+}
+
 static int start_clip(const char *filename, const char *body)
 {
 	long start_ms;
@@ -1418,7 +1588,9 @@ static int start_clip(const char *filename, const char *body)
 
 	audio = parse_json_audio(body);
 	snprintf(g_clip_input, sizeof(g_clip_input), "%s", filename);
-	make_clip_output(g_clip_output, sizeof(g_clip_output), filename, start_ms, end_ms, audio);
+	if (make_unique_clip_output(g_clip_output, sizeof(g_clip_output), filename,
+		start_ms, end_ms, audio) != 0)
+		return 500;
 	snprintf(input_path, sizeof(input_path), "%s/%s", RECORDINGS_DIR, g_clip_input);
 	snprintf(output_path, sizeof(output_path), "%s/%s", RECORDINGS_DIR, g_clip_output);
 	find_executable(exe, sizeof(exe),
@@ -1430,7 +1602,7 @@ static int start_clip(const char *filename, const char *body)
 	g_clip_error[0] = '\0';
 	g_clip_started_at = time(NULL);
 	g_clip_finished_at = 0;
-	log_msg("clip accepted: %s -> %s", g_clip_input, g_clip_output);
+	log_info("clip accepted: %s -> %s", g_clip_input, g_clip_output);
 
 	pid = fork();
 	if (pid < 0) {
@@ -1453,57 +1625,88 @@ static int start_clip(const char *filename, const char *body)
 	return 200;
 }
 
-static bool parse_range_header(const char *req, off_t file_size, off_t *start, off_t *end)
+/* 0 = no Range header, 1 = valid range, -1 = malformed/unsatisfiable. */
+static const char *find_http_header(const char *req, const char *name)
 {
-	const char *p = strstr(req, "Range:");
+	size_t name_len = strlen(name);
+	const char *line = req;
+
+	while (line != NULL && *line != '\0') {
+		const char *end = strstr(line, "\r\n");
+		size_t line_len = end != NULL ? (size_t)(end - line) : strlen(line);
+		if (line_len >= name_len && strncasecmp(line, name, name_len) == 0)
+			return line + name_len;
+		if (end == NULL)
+			break;
+		line = end + 2;
+	}
+	return NULL;
+}
+
+static int parse_range_header(const char *req, off_t file_size, off_t *start, off_t *end)
+{
+	const char *p = find_http_header(req, "Range:");
 	char *dash;
 	char *parse_end;
 	long long a;
 	long long b;
 
 	if (p == NULL)
-		p = strstr(req, "range:");
-	if (p == NULL)
-		return false;
+		return 0;
 
-	p = strstr(p, "bytes=");
-	if (p == NULL)
-		return false;
+	while (*p == ' ' || *p == '\t')
+		++p;
+	if (strncasecmp(p, "bytes=", 6) != 0)
+		return -1;
 	p += 6;
 
 	dash = strchr(p, '-');
 	if (dash == NULL)
-		return false;
+		return -1;
 
 	if (dash == p) {
 		errno = 0;
 		b = strtoll(dash + 1, &parse_end, 10);
 		if (errno != 0 || parse_end == dash + 1 || b <= 0)
-			return false;
+			return -1;
+		while (*parse_end == ' ' || *parse_end == '\t')
+			++parse_end;
+		if (*parse_end != '\0' && *parse_end != '\r' && *parse_end != '\n')
+			return -1;
 		if (b > file_size)
 			b = file_size;
 		*start = file_size - (off_t)b;
 		*end = file_size - 1;
-		return true;
+		return *start >= file_size ? -1 : 1;
 	}
 
 	errno = 0;
 	a = strtoll(p, &parse_end, 10);
 	if (errno != 0 || parse_end != dash || a < 0)
-		return false;
+		return -1;
 
-	if (*(dash + 1) == '\0' || *(dash + 1) == '\r' || *(dash + 1) == '\n' || *(dash + 1) == ' ') {
+	if (*(dash + 1) == '\0' || *(dash + 1) == '\r' || *(dash + 1) == '\n' ||
+		*(dash + 1) == ' ' || *(dash + 1) == '\t') {
 		b = file_size - 1;
+		parse_end = dash + 1;
+		while (*parse_end == ' ' || *parse_end == '\t')
+			++parse_end;
+		if (*parse_end != '\0' && *parse_end != '\r' && *parse_end != '\n')
+			return -1;
 	} else {
 		errno = 0;
 		b = strtoll(dash + 1, &parse_end, 10);
 		if (errno != 0 || parse_end == dash + 1 || b < a)
-			return false;
+			return -1;
+		while (*parse_end == ' ' || *parse_end == '\t')
+			++parse_end;
+		if (*parse_end != '\0' && *parse_end != '\r' && *parse_end != '\n')
+			return -1;
 	}
 
 	*start = (off_t)a;
 	*end = b >= file_size ? file_size - 1 : (off_t)b;
-	return true;
+	return *start >= file_size || *end < *start ? -1 : 1;
 }
 
 static void send_file_range_not_satisfiable(int fd, off_t file_size)
@@ -1516,7 +1719,7 @@ static void send_file_range_not_satisfiable(int fd, off_t file_size)
 		"Content-Length: 0\r\n"
 		"Connection: close\r\n\r\n",
 		(long long)file_size);
-	send_all(fd, head, strlen(head));
+	(void)send_all(fd, head, strlen(head));
 }
 
 static void send_file(int fd, const char *method, const char *filename, const char *req)
@@ -1557,12 +1760,14 @@ static void send_file(int fd, const char *method, const char *filename, const ch
 	}
 
 	end = st.st_size - 1;
-	if (parse_range_header(req, st.st_size, &start, &end)) {
-		if (start < 0 || start >= st.st_size || end < start) {
+	{
+		int range_result = parse_range_header(req, st.st_size, &start, &end);
+		if (range_result < 0) {
 			send_file_range_not_satisfiable(fd, st.st_size);
 			close(in);
 			return;
 		}
+		if (range_result > 0)
 		partial = true;
 	}
 	if (partial && has_suffix(filename, ".mp4") && end - start + 1 > FILE_RANGE_CHUNK_BYTES)
@@ -1590,7 +1795,10 @@ static void send_file(int fd, const char *method, const char *filename, const ch
 			has_suffix(filename, ".jpg") ? "image/jpeg" : "video/mp4",
 			(long long)remaining, filename);
 	}
-	send_all(fd, head, strlen(head));
+	if (send_all(fd, head, strlen(head)) != 0) {
+		close(in);
+		return;
+	}
 	if (head_only) {
 		close(in);
 		return;
@@ -1601,7 +1809,8 @@ static void send_file(int fd, const char *method, const char *filename, const ch
 		n = read(in, buf, want);
 		if (n <= 0)
 			break;
-		send_all(fd, buf, (size_t)n);
+		if (send_all(fd, buf, (size_t)n) != 0)
+			break;
 		remaining -= n;
 	}
 	close(in);
@@ -1632,7 +1841,7 @@ static void send_file_in_child(int fd, const char *method, const char *filename,
 		close(fd);
 		_exit(0);
 	}
-	++g_file_children;
+	track_file_child(pid);
 }
 
 #define INDEX_HTML_PATH "/usr/share/wifi-camera/index.html"
@@ -1745,7 +1954,7 @@ static void handle_client(int fd)
 		} else {
 			snprintf(full, sizeof(full), "%s/%s", RECORDINGS_DIR, name);
 			if (unlink(full) == 0) {
-				log_msg("recording deleted: %s", name);
+				log_info("recording deleted: %s", name);
 				http_reply(fd, 200, "application/json", "{\"ok\":true}");
 			} else {
 				http_reply(fd, 404, "application/json", "{\"error\":\"not found\"}");
@@ -1843,7 +2052,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	log_msg("listening on port %d", g_server_port);
+	log_info("listening on port %d", g_server_port);
 	while (!g_shutdown) {
 		fd_set read_fds;
 		struct timeval timeout;
@@ -1884,19 +2093,33 @@ int main(int argc, char **argv)
 		check_low_space_stop();
 	}
 
-	if (g_rec_pid > 0)
+	if (g_rec_pid > 0) {
 		stop_recording();
+		if (g_rec_pid > 0)
+			terminate_child(&g_rec_pid, "record process", 5000);
+	}
 	stop_preview();
 	set_record_led(false);
 	if (g_frame_pid > 0) {
 		char frame_path[PATH_MAX];
-		kill(g_frame_pid, SIGTERM);
+		terminate_child(&g_frame_pid, "frame process", 5000);
 		snprintf(frame_path, sizeof(frame_path), "%s/%s", RECORDINGS_DIR, g_frame_file);
 		unlink(frame_path);
 	}
 	if (g_clip_pid > 0)
-		kill(g_clip_pid, SIGTERM);
-	log_msg("server stop");
+		terminate_child(&g_clip_pid, "clip process", 5000);
+	for (int i = 0; i < 100 && g_file_children > 0; ++i) {
+		poll_children();
+		if (g_file_children > 0)
+			usleep(50 * 1000);
+	}
+	/* File responses are independent children; do not leave any behind. */
+	while (g_file_children > 0) {
+		pid_t pid = g_file_child_pids[0];
+		terminate_child(&g_file_child_pids[0], "file response process", 0);
+		untrack_file_child(pid);
+	}
+	log_info("server stop");
 	if (g_log != NULL)
 		fclose(g_log);
 	close(server_fd);

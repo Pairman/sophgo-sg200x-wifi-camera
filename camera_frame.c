@@ -28,7 +28,7 @@
 #define OPT_SENSOR_TYPE GCORE_GC4653_MIPI_720P_60FPS_10BIT
 #define GC4653_VTS_H_ADDR 0x0340
 #define GC4653_VTS_L_ADDR 0x0341
-#define GC4653_720P25_VTS 1800
+#define GC4653_720P25_VTS 3600
 #define GC4653_720P_PREVIEW_VTS 16364
 
 extern int gc4653_write_register(VI_PIPE ViPipe, int addr, int data);
@@ -60,22 +60,25 @@ static void cleanup(void)
 		if (ret != CVI_SUCCESS)
 			CVI_TRACE_LOG(CVI_DBG_ERR, "CVI_VENC_StopRecvFrame failed: %#x\n", ret);
 		g_venc_receiving = false;
-
-		ret = CVI_VENC_ResetChn(FRAME_VENC_CHN);
-		if (ret != CVI_SUCCESS)
-			CVI_TRACE_LOG(CVI_DBG_ERR, "CVI_VENC_ResetChn failed: %#x\n", ret);
 	}
 
 	if (g_venc_created) {
-		CVI_S32 ret = CVI_VENC_DestroyChn(FRAME_VENC_CHN);
+		CVI_S32 ret = CVI_VENC_ResetChn(FRAME_VENC_CHN);
+		if (ret != CVI_SUCCESS)
+			CVI_TRACE_LOG(CVI_DBG_ERR, "CVI_VENC_ResetChn failed: %#x\n", ret);
+		ret = CVI_VENC_DestroyChn(FRAME_VENC_CHN);
 		if (ret != CVI_SUCCESS)
 			CVI_TRACE_LOG(CVI_DBG_ERR, "CVI_VENC_DestroyChn failed: %#x\n", ret);
 		g_venc_created = false;
 	}
 
 	if (g_vi_started) {
-		SAMPLE_COMM_VI_DestroyIsp(&g_vi_config);
-		SAMPLE_COMM_VI_DestroyVi(&g_vi_config);
+		CVI_S32 ret = SAMPLE_COMM_VI_DestroyIsp(&g_vi_config);
+		if (ret != CVI_SUCCESS)
+			CVI_TRACE_LOG(CVI_DBG_ERR, "SAMPLE_COMM_VI_DestroyIsp failed: %#x\n", ret);
+		ret = SAMPLE_COMM_VI_DestroyVi(&g_vi_config);
+		if (ret != CVI_SUCCESS)
+			CVI_TRACE_LOG(CVI_DBG_ERR, "SAMPLE_COMM_VI_DestroyVi failed: %#x\n", ret);
 		g_vi_started = false;
 	}
 
@@ -87,18 +90,13 @@ static void cleanup(void)
 	memset(&g_vi_config, 0, sizeof(g_vi_config));
 }
 
-static void exit_with_cleanup(int code)
-{
-	cleanup();
-	exit(code);
-}
-
 static void signal_handler(int signal_no, siginfo_t *siginfo, void *context)
 {
 	UNUSED(signal_no);
 	UNUSED(siginfo);
 	UNUSED(context);
-	exit_with_cleanup(1);
+	/* Defer teardown to normal control flow; cleanup is not signal-safe. */
+	g_stop = 1;
 }
 
 static CVI_S32 install_signal_handlers(void)
@@ -328,13 +326,17 @@ static CVI_S32 save_jpeg_stream(const char *output_path)
 	}
 
 	ret = SAMPLE_COMM_VENC_SaveStream(PT_JPEG, output, &stream);
-	fclose(output);
+	if (fclose(output) != 0 && ret == CVI_SUCCESS)
+		ret = CVI_FAILURE;
 
 out_release_stream:
 	{
 		CVI_S32 release_ret = CVI_VENC_ReleaseStream(FRAME_VENC_CHN, &stream);
-		if (release_ret != CVI_SUCCESS)
+		if (release_ret != CVI_SUCCESS) {
 			CVI_TRACE_LOG(CVI_DBG_ERR, "CVI_VENC_ReleaseStream failed: %#x\n", release_ret);
+			if (ret == CVI_SUCCESS)
+				ret = release_ret;
+		}
 	}
 out_free_pack:
 	free(stream.pstPack);
@@ -397,6 +399,8 @@ static CVI_S32 capture_frame_once(const char *output_path)
 		CVI_S32 release_ret = CVI_VI_ReleaseChnFrame(FRAME_VI_DEV, FRAME_VI_CHN, &frame);
 		if (release_ret != CVI_SUCCESS)
 			CVI_TRACE_LOG(CVI_DBG_ERR, "CVI_VI_ReleaseChnFrame failed: %#x\n", release_ret);
+		if (ret == CVI_SUCCESS && release_ret != CVI_SUCCESS)
+			ret = release_ret;
 	}
 
 	return ret;
@@ -466,12 +470,14 @@ static CVI_S32 capture_preview(const char *output_path)
 				CVI_TRACE_LOG(CVI_DBG_ERR, "preview CVI_VENC_StopRecvFrame failed: %#x\n", ret);
 				return ret;
 			}
+			g_venc_receiving = false;
 			VENC_RECV_PIC_PARAM_S recv_param;
 			memset(&recv_param, 0, sizeof(recv_param));
 			recv_param.s32RecvPicNum = 1;
 			ret = CVI_VENC_StartRecvFrame(FRAME_VENC_CHN, &recv_param);
 			if (ret != CVI_SUCCESS)
 				return ret;
+			g_venc_receiving = true;
 		}
 	}
 	return CVI_SUCCESS;
