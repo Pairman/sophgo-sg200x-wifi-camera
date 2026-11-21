@@ -21,7 +21,7 @@ KERNEL_INC ?= $(KERNEL_DIR)/riscv/usr/include
 MEDIA_SERVER_DIR := $(MIDDLEWARE_DIR)/sample/test_mmf/media_server-1.0.x
 
 COMMON_CFLAGS := \
-	-Os -g -std=gnu11 -Wall -Wextra -ffunction-sections -fdata-sections \
+	-O2 -g -std=gnu11 -Wall -Wextra -ffunction-sections -fdata-sections \
 	-mcpu=c906fdv -march=rv64imafdcv0p7xthead -mcmodel=medany -mabi=lp64d \
 	-DARCH_$(CHIP_ARCH) -D__CV181X__ -D__SOC_MARS__ \
 	-DSENSOR0_TYPE=SONY_IMX327_MIPI_2M_30FPS_12BIT \
