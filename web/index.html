@@ -11,7 +11,7 @@
 <header class="header"><h2>Wi-Fi Camera</h2><span id="state">Connecting…</span></header>
 <main class="main"><section class="stream-container"><canvas id="streamCanvas"></canvas><div id="loading" class="stream-loading">Preview starts when this page is visible</div><div class="status-overlay" id="resolutionLabel">720p, 1 fps</div></section>
 <aside class="controls-panel"><nav class="tabs"><button class="tab-btn active" data-tab="camera">Camera</button><button class="tab-btn" data-tab="recordings">Recordings</button></nav>
-<section class="tab-pane active" id="camera"><div class="group"><h3>Image</h3><div class="row"><label for="resolution">Resolution</label><select id="resolution"><option value="720p">720p</option><option value="1440p">1440p</option></select></div></div>
+<section class="tab-pane active" id="camera"><div class="group"><h3>Image</h3><div class="row"><label for="resolution">Resolution</label><select id="resolution"><option value="720p">720p</option><option value="1440p">1440p</option></select><label for="previewFps">Preview rate</label><select id="previewFps"><option value="1">1 fps</option><option value="2">2 fps</option><option value="5">5 fps</option></select></div></div>
 <div class="group"><h3>Capture</h3><div class="row"><button id="capture">Take photo</button><a id="downloadFrame" class="button secondary" href="#" download="camera-preview.jpg">Download preview</a></div></div>
 <div class="group"><h3>Video recording</h3><div class="row"><label><input id="audio" type="checkbox"> Record sound</label></div><button id="record">● Start recording</button><p class="muted">Sound recording is off by default.</p></div>
 <div class="group"><h3>Status</h3><div id="status" class="status-grid"><span>Loading…</span></div></div></section>
@@ -19,8 +19,9 @@
 <script>
 const $=id=>document.getElementById(id);
 let busy=false,previewGeneration=0,previewRetryAt=0,previewBackoff=1000;
-let previewInFlight=false,previewImage=null,previewTimer=null;
-let refreshInFlight=false,refreshQueued=false;
+let previewInFlight=false,previewImage=null,previewTimer=null,previewDownloadUrl=null;
+let refreshInFlight=false,refreshQueued=false,previewLoop=null;
+function setPreviewLoop(fps){if(previewLoop!==null)clearInterval(previewLoop);previewLoop=setInterval(drawPreview,Math.max(200,Math.round(1000/fps)))}
 async function api(url,options){const r=await fetch(url,options);const t=await r.text();let v;try{v=JSON.parse(t)}catch{v=t}if(!r.ok)throw Error(typeof v==='string'?v:(v.error||r.statusText));return v}
 function resetPreviewBackoff(){previewRetryAt=0;previewBackoff=1000}
 function cancelPreviewRequest(){previewGeneration++;if(previewTimer!==null){clearTimeout(previewTimer);previewTimer=null}if(previewImage!==null){previewImage.onload=null;previewImage.onerror=null;previewImage.src='';previewImage=null}previewInFlight=false}
@@ -29,7 +30,7 @@ function drawPreview(){
   const generation=previewGeneration,u='/api/preview.jpg?t='+Date.now(),im=new Image();
   previewInFlight=true;previewImage=im;
   const finish=()=>{if(previewImage===im){previewImage=null;previewInFlight=false;if(previewTimer!==null){clearTimeout(previewTimer);previewTimer=null}}};
-  im.onload=()=>{finish();if(generation!==previewGeneration||document.hidden)return;previewBackoff=1000;previewRetryAt=0;const c=$('streamCanvas'),ctx=c.getContext('2d');c.width=im.naturalWidth;c.height=im.naturalHeight;ctx.drawImage(im,0,0);$('loading').hidden=true;$('downloadFrame').href=u};
+  im.onload=()=>{finish();if(generation!==previewGeneration||document.hidden)return;previewBackoff=1000;previewRetryAt=0;const c=$('streamCanvas'),ctx=c.getContext('2d');c.width=im.naturalWidth;c.height=im.naturalHeight;ctx.drawImage(im,0,0);$('loading').hidden=true;c.toBlob(blob=>{if(!blob)return;if(previewDownloadUrl)URL.revokeObjectURL(previewDownloadUrl);previewDownloadUrl=URL.createObjectURL(blob);$('downloadFrame').href=previewDownloadUrl},'image/jpeg',.92)};
   im.onerror=()=>{finish();if(generation!==previewGeneration)return;$('loading').hidden=false;$('loading').textContent='Preview unavailable or starting…';previewRetryAt=Date.now()+previewBackoff;previewBackoff=Math.min(previewBackoff*2,10000)};
   previewTimer=setTimeout(()=>{if(previewImage!==im)return;cancelPreviewRequest();$('loading').hidden=false;$('loading').textContent='Preview request timed out…';previewRetryAt=Date.now()+previewBackoff;previewBackoff=Math.min(previewBackoff*2,10000)},8000);
   im.src=u;
@@ -48,7 +49,7 @@ async function refresh(){
     $('state').textContent=s.state==='recording'?'Recording':s.state==='starting'?'Starting…':s.state==='stopping'?'Stopping…':s.frame_capturing?'Taking photo':s.state==='error'?'Error':'Ready';
     $('state').className=s.recording?'recording':'';
     $('record').textContent=s.recording?'■ Stop recording':'● Start recording';
-    $('resolution').value=s.resolution;$('resolution').disabled=busy;$('record').disabled=!!s.frame_capturing||s.state==='starting'||s.state==='stopping';$('capture').disabled=busy;$('resolutionLabel').textContent=s.resolution+', 1 fps';
+    $('resolution').value=s.resolution;$('previewFps').value=s.preview_fps||1;$('resolution').disabled=busy;$('previewFps').disabled=busy;$('record').disabled=!!s.frame_capturing||s.state==='starting'||s.state==='stopping';$('capture').disabled=busy;$('resolutionLabel').textContent=s.resolution+', '+(s.preview_fps||1)+' fps';
     if(busy){$('streamCanvas').width=0;$('streamCanvas').height=0;$('loading').hidden=false;$('loading').textContent='Camera is recording or capturing'}
     const items=await api('/api/recordings');
     $('files').replaceChildren(...items.map(x=>{const li=document.createElement('li');const a=document.createElement('a');a.href='/recordings/'+encodeURIComponent(x.name);a.textContent=x.name;a.download=x.name;li.append(a,document.createTextNode(' · '+x.type+' · '+(x.size/1048576).toFixed(1)+' MiB'));const actions=document.createElement('div');actions.className='file-actions';const del=document.createElement('button');del.className='secondary';del.textContent='Delete';del.onclick=()=>deleteRecording(x.name);actions.append(del);li.append(actions);return li}));
@@ -56,7 +57,8 @@ async function refresh(){
 }
 async function deleteRecording(name){if(!confirm('Delete '+name+'?'))return;try{await api('/api/recordings/'+encodeURIComponent(name),{method:'DELETE'});refresh()}catch(e){alert(e.message)}}
 $('resolution').onchange=async e=>{cancelPreviewRequest();resetPreviewBackoff();try{await api('/api/resolution',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resolution:e.target.value})});$('streamCanvas').width=0;$('streamCanvas').height=0;$('loading').hidden=false;$('loading').textContent='Starting '+e.target.value+' preview…';drawPreview();refresh()}catch(err){alert(err.message);refresh()}};
+$('previewFps').onchange=async e=>{try{const fps=Number(e.target.value);await api('/api/preview-rate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fps})});setPreviewLoop(fps);refresh()}catch(err){alert(err.message);refresh()}};
 $('record').onclick=async()=>{try{const s=await api('/api/status');if(s.recording)await api('/api/record/stop',{method:'POST'});else await api('/api/record/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({audio:$('audio').checked})});refresh()}catch(e){alert(e.message)}};
 $('capture').onclick=async()=>{try{await api('/api/frame/capture',{method:'POST'});refresh()}catch(e){alert(e.message)}};
-document.querySelectorAll('.tab-btn').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab-btn,.tab-pane').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.tab).classList.add('active');document.body.classList.toggle('recordings-active',b.dataset.tab==='recordings')});document.addEventListener('visibilitychange',()=>{if(document.hidden)cancelPreviewRequest();else{resetPreviewBackoff();drawPreview()}});drawPreview();setInterval(drawPreview,1000);refresh();setInterval(refresh,5000);
+document.querySelectorAll('.tab-btn').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab-btn,.tab-pane').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.tab).classList.add('active');document.body.classList.toggle('recordings-active',b.dataset.tab==='recordings')});document.addEventListener('visibilitychange',()=>{if(document.hidden)cancelPreviewRequest();else{resetPreviewBackoff();drawPreview()}});drawPreview();setPreviewLoop(1);refresh();setInterval(refresh,5000);
 </script></body></html>

@@ -43,6 +43,7 @@ static bool g_venc_receiving;
 static bool g_venc_fd_open;
 static CVI_S32 g_venc_fd = -1;
 static bool g_mode_1440p;
+static unsigned g_preview_fps = 1;
 static volatile sig_atomic_t g_stop;
 
 static void cleanup(void)
@@ -464,9 +465,9 @@ static CVI_S32 capture_preview(const char *output_path)
 			return ret;
 		if (rename(temp_path, output_path) != 0)
 			return CVI_FAILURE;
-		/* The sensor runs at its lowest documented mode; publish at 1 fps. */
-		for (int i = 0; i < 10 && !g_stop; ++i)
-			usleep(100 * 1000);
+		unsigned interval_us = 1000000U / g_preview_fps;
+		for (unsigned elapsed = 0; elapsed < 1000000U && !g_stop; elapsed += interval_us)
+			usleep(interval_us);
 		if (!g_stop) {
 			ret = CVI_VENC_StopRecvFrame(FRAME_VENC_CHN);
 			if (ret != CVI_SUCCESS) {
@@ -488,7 +489,7 @@ static CVI_S32 capture_preview(const char *output_path)
 
 static void usage(const char *program)
 {
-	fprintf(stderr, "Usage: %s [-o output.jpg] [-p preview.jpg] [-r 720p|1440p]\n", program);
+	fprintf(stderr, "Usage: %s [-o output.jpg] [-p preview.jpg] [-r 720p|1440p] [-f 1|2|5]\n", program);
 }
 
 int main(int argc, char **argv)
@@ -507,7 +508,7 @@ int main(int argc, char **argv)
 
 	snprintf(output_path, sizeof(output_path), "frame_%lld.jpg", (long long)now);
 
-	while ((opt = getopt(argc, argv, "o:p:r:")) != -1) {
+	while ((opt = getopt(argc, argv, "o:p:r:f:")) != -1) {
 		switch (opt) {
 		case 'o':
 			if (optarg[0] == '\0') {
@@ -536,6 +537,16 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			break;
+		case 'f': {
+			char *end;
+			long fps = strtol(optarg, &end, 10);
+			if (*optarg == '\0' || *end != '\0' || (fps != 1 && fps != 2 && fps != 5)) {
+				usage(argv[0]);
+				return 1;
+			}
+			g_preview_fps = (unsigned)fps;
+			break;
+		}
 		default:
 			usage(argv[0]);
 			return 1;

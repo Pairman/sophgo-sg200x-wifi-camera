@@ -91,6 +91,7 @@ static char g_frame_file[NAME_MAX + 1];
 static pid_t g_preview_pid = -1;
 static time_t g_preview_last_request;
 static time_t g_preview_retry_after;
+static unsigned g_preview_fps = 1;
 
 static clip_state_t g_clip_state = CLIP_NONE;
 static pid_t g_clip_pid = -1;
@@ -470,7 +471,9 @@ static int start_preview(void)
 	}
 	if (g_preview_pid == 0) {
 		setpriority(PRIO_PROCESS, 0, 10);
-		execl(exe, exe, "-p", PREVIEW_FILE, "-r", resolution, (char *)NULL);
+		char fps[8];
+		snprintf(fps, sizeof(fps), "%u", g_preview_fps);
+		execl(exe, exe, "-p", PREVIEW_FILE, "-r", resolution, "-f", fps, (char *)NULL);
 		_exit(127);
 	}
 	log_info("on-demand preview process started: pid=%ld", (long)g_preview_pid);
@@ -1358,12 +1361,12 @@ static void reply_status(int fd)
 		snprintf(temperature_json, sizeof(temperature_json), "null");
 	snprintf(body, sizeof(body),
 		"{\"state\":\"%s\",\"recording\":%s,\"resolution\":\"%s\",\"current_file\":\"%s\","
-		"\"duration_ms\":%ld,\"frame_capturing\":%s,\"free_bytes\":%llu,\"low_storage\":%s,"
+		"\"duration_ms\":%ld,\"frame_capturing\":%s,\"preview_fps\":%u,\"free_bytes\":%llu,\"low_storage\":%s,"
 		"\"last_error\":\"%s\",\"soc_temperature_c\":%s}",
 		state_name(g_rec_state),
 		g_rec_state == REC_RECORDING ? "true" : "false",
 		g_mode_1440p ? "1440p" : "720p",
-		file, duration, g_frame_pid > 0 ? "true" : "false", (unsigned long long)free_bytes(),
+		file, duration, g_frame_pid > 0 ? "true" : "false", g_preview_fps, (unsigned long long)free_bytes(),
 		low_storage() ? "true" : "false", err, temperature_json);
 	http_reply(fd, 200, "application/json", body);
 }
@@ -1522,6 +1525,28 @@ static int set_resolution(const char *body)
 		unlink(PREVIEW_FILE ".tmp");
 		g_mode_1440p = mode_1440p;
 		log_info("capture resolution selected: %s", g_mode_1440p ? "1440p" : "720p");
+	}
+	return 200;
+}
+
+static int set_preview_fps(const char *body)
+{
+	const char *p = strstr(body, "\"fps\"");
+	char *end;
+	long fps;
+
+	if (p == NULL || (p = strchr(p, ':')) == NULL)
+		return 400;
+	fps = strtol(p + 1, &end, 10);
+	if (end == p + 1 || (fps != 1 && fps != 2 && fps != 5))
+		return 400;
+	if ((unsigned)fps != g_preview_fps) {
+		if (g_rec_pid > 0 || g_frame_pid > 0 || g_rec_state != REC_IDLE)
+			return 409;
+		stop_preview();
+		g_preview_fps = (unsigned)fps;
+		unlink(PREVIEW_FILE);
+		unlink(PREVIEW_FILE ".tmp");
 	}
 	return 200;
 }
@@ -1980,6 +2005,9 @@ static void handle_client(int fd)
 		reply_status(fd);
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/resolution") == 0) {
 		int rc = set_resolution(body);
+		http_reply(fd, rc, "application/json", rc == 200 ? "{\"ok\":true}" : "{\"ok\":false}");
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/preview-rate") == 0) {
+		int rc = set_preview_fps(body);
 		http_reply(fd, rc, "application/json", rc == 200 ? "{\"ok\":true}" : "{\"ok\":false}");
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/record/start") == 0) {
 		bool audio_enabled = false;
