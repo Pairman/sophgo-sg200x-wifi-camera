@@ -106,7 +106,10 @@ static CVI_S32 install_signal_handlers(void)
 	memset(&action, 0, sizeof(action));
 	sigemptyset(&action.sa_mask);
 	action.sa_sigaction = signal_handler;
-	action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+	/* Keep the handler installed while teardown is in progress.  The CVI
+	 * calls may take a while to return; a second termination signal must not
+	 * turn into an immediate, unclean default-action exit. */
+	action.sa_flags = SA_SIGINFO;
 
 	if (sigaction(SIGINT, &action, NULL) != 0)
 		return CVI_FAILURE;

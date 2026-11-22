@@ -42,6 +42,13 @@
 #define RECORD_SECONDS 31536000
 #define LOG_MAX_BYTES (1024 * 1024)
 #define LOG_ROTATIONS 3
+/*
+ * VI/VENC teardown can take several seconds on the single-core SG200x.
+ * Killing camera-frame while it is inside a CVI ioctl leaves the global
+ * MMF state allocated, so a later worker cannot initialise the pipeline.
+ */
+#define PREVIEW_STOP_TIMEOUT_MS 30000
+#define PREVIEW_IDLE_TIMEOUT_SEC 10
 
 typedef enum {
 	REC_IDLE = 0,
@@ -402,7 +409,8 @@ static void terminate_child(pid_t *pid_ptr, const char *name, int timeout_ms)
 			break;
 		usleep(50 * 1000);
 	}
-	log_msg("%s did not exit after SIGTERM; sending SIGKILL", name);
+	log_msg("%s did not exit after %d ms; sending SIGKILL; CVI pipeline may require a board reset",
+		name, timeout_ms);
 	if (kill(pid, SIGKILL) != 0 && errno != ESRCH)
 		log_msg("%s SIGKILL failed: %s", name, strerror(errno));
 	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
@@ -414,7 +422,10 @@ static void stop_preview(void)
 {
 	if (g_preview_pid <= 0)
 		return;
-	terminate_child(&g_preview_pid, "preview process", 5000);
+	/* Give camera-frame enough time to leave VI_GetChnFrame and run cleanup().
+	 * terminate_child still has a last-resort SIGKILL, but it is now outside
+	 * the normal teardown window and is logged as a media-pipeline failure. */
+	terminate_child(&g_preview_pid, "preview process", PREVIEW_STOP_TIMEOUT_MS);
 }
 
 static int start_preview(void)
@@ -2068,7 +2079,8 @@ int main(int argc, char **argv)
 		poll_children();
 		check_low_space_stop();
 		if (g_preview_pid > 0 && g_preview_last_request > 0 &&
-		    time(NULL) - g_preview_last_request >= 3 && g_rec_state == REC_IDLE && g_frame_pid <= 0)
+		    time(NULL) - g_preview_last_request >= PREVIEW_IDLE_TIMEOUT_SEC &&
+		    g_rec_state == REC_IDLE && g_frame_pid <= 0)
 			stop_preview();
 		if (ready < 0) {
 			if (errno == EINTR)
