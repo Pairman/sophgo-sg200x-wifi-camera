@@ -49,6 +49,7 @@
  */
 #define PREVIEW_STOP_TIMEOUT_MS 30000
 #define PREVIEW_IDLE_TIMEOUT_SEC 10
+#define PREVIEW_START_WAIT_MS 5000
 
 typedef enum {
 	REC_IDLE = 0,
@@ -359,6 +360,27 @@ static uint64_t free_bytes(void)
 	if (statvfs(RECORDINGS_DIR, &st) != 0)
 		return 0;
 	return (uint64_t)st.f_bavail * (uint64_t)st.f_frsize;
+}
+
+/* Linux exposes the SG200x SoC temperature in millidegrees Celsius. */
+static bool read_soc_temperature(double *temperature_c)
+{
+	FILE *file;
+	long millidegrees;
+
+	if (temperature_c == NULL)
+		return false;
+	file = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+	if (file == NULL || fscanf(file, "%ld", &millidegrees) != 1) {
+		if (file != NULL)
+			fclose(file);
+		return false;
+	}
+	fclose(file);
+	if (millidegrees < -100000 || millidegrees > 200000)
+		return false;
+	*temperature_c = (double)millidegrees / 1000.0;
+	return true;
 }
 
 static bool low_storage(void)
@@ -1232,10 +1254,23 @@ static void reply_preview_jpeg(int fd)
 		http_reply(fd, 503, "text/plain", "preview worker could not start");
 		return;
 	}
-	image_fd = open(PREVIEW_FILE, O_RDONLY | O_CLOEXEC);
-	if (image_fd < 0 || fstat(image_fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
-		if (image_fd >= 0)
+	/* The first frame needs ISP/VENC startup, sensor warm-up and one JPEG
+	 * encode.  Keep the initial HTTP request pending for a short bounded
+	 * interval instead of returning 503 immediately and making the browser
+	 * back off to 8 seconds before trying again. */
+	image_fd = -1;
+	for (int waited = 0; waited <= PREVIEW_START_WAIT_MS; waited += 50) {
+		image_fd = open(PREVIEW_FILE, O_RDONLY | O_CLOEXEC);
+		if (image_fd >= 0 && fstat(image_fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0)
+			break;
+		if (image_fd >= 0) {
 			close(image_fd);
+			image_fd = -1;
+		}
+		if (waited < PREVIEW_START_WAIT_MS)
+			usleep(50 * 1000);
+	}
+	if (image_fd < 0) {
 		http_reply(fd, 503, "text/plain", "preview frame is starting");
 		return;
 	}
@@ -1302,6 +1337,9 @@ static void reply_status(int fd)
 	char err[512];
 	time_t now = time(NULL);
 	long duration = 0;
+	double soc_temperature_c = 0.0;
+	bool have_soc_temperature;
+	char temperature_json[32];
 
 	poll_children();
 	check_low_space_stop();
@@ -1313,15 +1351,20 @@ static void reply_status(int fd)
 	}
 	json_escape(file, sizeof(file), g_current_file);
 	json_escape(err, sizeof(err), g_last_error);
+	have_soc_temperature = read_soc_temperature(&soc_temperature_c);
+	if (have_soc_temperature)
+		snprintf(temperature_json, sizeof(temperature_json), "%.1f", soc_temperature_c);
+	else
+		snprintf(temperature_json, sizeof(temperature_json), "null");
 	snprintf(body, sizeof(body),
 		"{\"state\":\"%s\",\"recording\":%s,\"resolution\":\"%s\",\"current_file\":\"%s\","
 		"\"duration_ms\":%ld,\"frame_capturing\":%s,\"free_bytes\":%llu,\"low_storage\":%s,"
-		"\"last_error\":\"%s\"}",
+		"\"last_error\":\"%s\",\"soc_temperature_c\":%s}",
 		state_name(g_rec_state),
 		g_rec_state == REC_RECORDING ? "true" : "false",
 		g_mode_1440p ? "1440p" : "720p",
 		file, duration, g_frame_pid > 0 ? "true" : "false", (unsigned long long)free_bytes(),
-		low_storage() ? "true" : "false", err);
+		low_storage() ? "true" : "false", err, temperature_json);
 	http_reply(fd, 200, "application/json", body);
 }
 
