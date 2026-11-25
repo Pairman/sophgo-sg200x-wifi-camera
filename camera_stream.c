@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,6 +62,10 @@ static fmp4_writer_t *g_fmp4;
 static struct pcm *g_audio_pcm;
 static AAC_ENCODER_S *g_aac_encoder;
 static struct mpeg4_avc_t g_avc;
+static VENC_PACK_S *g_packs;
+static size_t g_packs_capacity;
+static CVI_U8 *g_frame_buffer, *g_sample_buffer;
+static size_t g_frame_capacity, g_sample_capacity;
 static int g_fmp4_track = -1;
 static int g_audio_track = -1;
 static CVI_U32 g_fmp4_frame_index;
@@ -158,8 +163,33 @@ static void cleanup(void)
 		SAMPLE_COMM_SYS_Exit();
 		g_sys_ready = false;
 	}
+	free(g_packs);
+	free(g_frame_buffer);
+	free(g_sample_buffer);
+	g_packs = NULL;
+	g_frame_buffer = g_sample_buffer = NULL;
+	g_packs_capacity = g_frame_capacity = g_sample_capacity = 0;
 
 	memset(&g_vi_config, 0, sizeof(g_vi_config));
+}
+
+static void *reserve_buffer(void *buffer, size_t *capacity, size_t needed)
+{
+	if (needed <= *capacity)
+		return buffer;
+	size_t size = *capacity ? *capacity : 256;
+	while (size < needed) {
+		if (size > SIZE_MAX / 2) {
+			size = needed;
+			break;
+		}
+		size *= 2;
+	}
+	void *p = realloc(buffer, size);
+	if (p == NULL)
+		return NULL;
+	*capacity = size;
+	return p;
 }
 
 static void signal_handler(int signo, siginfo_t *siginfo, void *context)
@@ -567,20 +597,23 @@ static CVI_S32 drain_audio_until(CVI_U64 max_pts_ms, bool wait_for_pcm)
 
 static CVI_S32 write_fmp4_frame(const CVI_U8 *annexb, size_t annexb_bytes)
 {
-	CVI_U8 *sample;
 	CVI_U8 extra_data[64 * 1024];
 	int extra_data_bytes;
 	int vcl = 0;
 	int update = 0;
 	int sample_bytes;
 	CVI_S32 ret;
+	CVI_U8 *sample;
 
-	sample = malloc(annexb_bytes + 64);
+	if (annexb_bytes > SIZE_MAX - 64)
+		return CVI_FAILURE;
+	sample = reserve_buffer(g_sample_buffer, &g_sample_capacity, annexb_bytes + 64);
 	if (sample == NULL)
 		return CVI_FAILURE;
+	g_sample_buffer = sample;
 
 	sample_bytes = h264_annexbtomp4(&g_avc, annexb, annexb_bytes,
-		sample, annexb_bytes + 64, &vcl, &update);
+		g_sample_buffer, g_sample_capacity, &vcl, &update);
 	if (sample_bytes <= 0) {
 		ret = CVI_FAILURE;
 		goto out;
@@ -607,7 +640,7 @@ static CVI_S32 write_fmp4_frame(const CVI_U8 *annexb, size_t annexb_bytes)
 		}
 	}
 
-	ret = fmp4_writer_write(g_fmp4, g_fmp4_track, sample, sample_bytes,
+	ret = fmp4_writer_write(g_fmp4, g_fmp4_track, g_sample_buffer, sample_bytes,
 		(CVI_S64)g_fmp4_frame_index * STREAM_FRAME_MS,
 		(CVI_S64)g_fmp4_frame_index * STREAM_FRAME_MS,
 		vcl == 1 ? MOV_AV_FLAG_KEYFREAME : 0);
@@ -615,7 +648,6 @@ static CVI_S32 write_fmp4_frame(const CVI_U8 *annexb, size_t annexb_bytes)
 		++g_fmp4_frame_index;
 
 out:
-	free(sample);
 	return ret;
 }
 
@@ -623,11 +655,13 @@ static CVI_S32 write_one_stream(void)
 {
 	VENC_CHN_STATUS_S status;
 	VENC_STREAM_S stream;
-	CVI_U8 *frame_data = NULL;
+	const CVI_U8 *frame_data;
 	size_t frame_bytes = 0;
 	size_t offset = 0;
 	CVI_S32 release_ret;
 	CVI_S32 ret;
+	VENC_PACK_S *packs;
+	size_t packs_bytes;
 
 	ret = wait_venc_stream();
 	if (ret != CVI_SUCCESS)
@@ -641,29 +675,49 @@ static CVI_S32 write_one_stream(void)
 		return CVI_FAILURE;
 
 	memset(&stream, 0, sizeof(stream));
-	stream.pstPack = malloc(sizeof(VENC_PACK_S) * status.u32CurPacks);
-	if (stream.pstPack == NULL)
+	if (__builtin_mul_overflow((size_t)status.u32CurPacks, sizeof(VENC_PACK_S), &packs_bytes))
 		return CVI_FAILURE;
+	packs = reserve_buffer(g_packs, &g_packs_capacity, packs_bytes);
+	if (packs == NULL)
+		return CVI_FAILURE;
+	g_packs = packs;
+	stream.pstPack = g_packs;
 
 	ret = CVI_VENC_GetStream(VENC_CHN_ID, &stream, 1000);
 	if (ret != CVI_SUCCESS)
-		goto out;
-
-	for (CVI_U32 i = 0; i < stream.u32PackCount; ++i)
-		frame_bytes += stream.pstPack[i].u32Len - stream.pstPack[i].u32Offset;
-
-	frame_data = malloc(frame_bytes);
-	if (frame_data == NULL) {
+		return ret;
+	if (stream.u32PackCount == 0 || stream.u32PackCount > status.u32CurPacks) {
 		ret = CVI_FAILURE;
 		goto release_stream;
 	}
 
 	for (CVI_U32 i = 0; i < stream.u32PackCount; ++i) {
 		VENC_PACK_S *pack = &stream.pstPack[i];
-		size_t bytes = pack->u32Len - pack->u32Offset;
+		if (pack->pu8Addr == NULL || pack->u32Offset > pack->u32Len ||
+		    pack->u32Len - pack->u32Offset > SIZE_MAX - frame_bytes) {
+			ret = CVI_FAILURE;
+			goto release_stream;
+		}
+		frame_bytes += pack->u32Len - pack->u32Offset;
+	}
+	if (stream.u32PackCount == 1) {
+		frame_data = stream.pstPack[0].pu8Addr + stream.pstPack[0].u32Offset;
+	} else {
+		CVI_U8 *buffer = reserve_buffer(g_frame_buffer, &g_frame_capacity, frame_bytes);
+		if (buffer == NULL) {
+			ret = CVI_FAILURE;
+			goto release_stream;
+		}
+		g_frame_buffer = buffer;
 
-		memcpy(frame_data + offset, pack->pu8Addr + pack->u32Offset, bytes);
-		offset += bytes;
+		for (CVI_U32 i = 0; i < stream.u32PackCount; ++i) {
+			VENC_PACK_S *pack = &stream.pstPack[i];
+			size_t bytes = pack->u32Len - pack->u32Offset;
+
+			memcpy(g_frame_buffer + offset, pack->pu8Addr + pack->u32Offset, bytes);
+			offset += bytes;
+		}
+		frame_data = g_frame_buffer;
 	}
 
 	ret = write_fmp4_frame(frame_data, frame_bytes);
@@ -676,9 +730,6 @@ release_stream:
 			ret = release_ret;
 	}
 
-out:
-	free(frame_data);
-	free(stream.pstPack);
 	return ret;
 }
 
